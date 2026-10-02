@@ -133,14 +133,14 @@ function pieceEdges(E, r, c) {
  * geometric curve -> neighbor pieces interlock exactly.
  * First point gets a lineTo, then each 3 points form a bezier. */
 var PROFILES = [
-  /* 0: classic round knob */
-  [[0.32, 0], [0.40, 0.02], [0.36, 0.10], [0.42, 0.14], [0.46, 0.22], [0.54, 0.22], [0.58, 0.14], [0.64, 0.10], [0.60, 0.02], [0.68, 0]],
-  /* 1: pointed knob */
-  [[0.30, 0], [0.40, 0.02], [0.36, 0.10], [0.44, 0.14], [0.46, 0.26], [0.54, 0.26], [0.56, 0.14], [0.64, 0.10], [0.60, 0.02], [0.70, 0]],
-  /* 2: wide shallow knob */
-  [[0.24, 0], [0.30, 0.02], [0.28, 0.06], [0.36, 0.08], [0.44, 0.12], [0.56, 0.12], [0.64, 0.08], [0.72, 0.06], [0.70, 0.02], [0.76, 0]],
-  /* 3: narrow deep knob */
-  [[0.38, 0], [0.42, 0.03], [0.40, 0.12], [0.44, 0.18], [0.47, 0.30], [0.53, 0.30], [0.56, 0.18], [0.60, 0.12], [0.58, 0.03], [0.62, 0]]
+  /* 0: classic tab - pinched neck, round head */
+  [[0.280,0],[0.325,0.003],[0.360,0.025],[0.385,0.020],[0.395,0.060],[0.415,0.115],[0.500,0.150],[0.585,0.115],[0.605,0.060],[0.615,0.020],[0.640,0.025],[0.675,0.003],[0.720,0]],
+  /* 1: tall tab - tighter neck, higher head */
+  [[0.300,0],[0.340,0.003],[0.368,0.022],[0.390,0.018],[0.398,0.055],[0.412,0.120],[0.500,0.175],[0.588,0.120],[0.602,0.055],[0.610,0.018],[0.632,0.022],[0.660,0.003],[0.700,0]],
+  /* 2: wide tab - broad head, gentler neck */
+  [[0.255,0],[0.300,0.003],[0.335,0.020],[0.360,0.022],[0.372,0.050],[0.395,0.100],[0.500,0.130],[0.605,0.100],[0.628,0.050],[0.640,0.022],[0.665,0.020],[0.700,0.003],[0.745,0]],
+  /* 3: stubby tab - short and stout */
+  [[0.310,0],[0.345,0.004],[0.370,0.028],[0.392,0.024],[0.402,0.058],[0.420,0.095],[0.500,0.115],[0.580,0.095],[0.598,0.058],[0.608,0.024],[0.630,0.028],[0.655,0.004],[0.690,0]]
 ];
 
 /* Knob-curve ops for one edge from (x1,y1) to (x2,y2).
@@ -160,11 +160,11 @@ function edgeGeom(x1, y1, x2, y2, tab, jit, prof, off, scl, wob) {
   var dx = x2 - x1, dy = y2 - y1;
   var len = Math.hypot(dx, dy) || 1;
   var nx = -dy / len, ny = dx / len;
-  var depth = tab * (0.13 + 0.03 * jit);
-  var wscl = 0.62 + 0.18 * scl;
+  var depth = tab * (0.17 + 0.03 * jit);
+  var wscl = 0.72 + 0.16 * scl;
   var wk = 1 + ((wob * 2) | 0);                    /* 1 or 2 waves */
   var ws = (((wob * 4) | 0) % 2 === 0) ? 1 : -1;   /* wobble sign */
-  var wamp = 0.015;
+  var wamp = 0.0;
   function W(f) { return wamp * ws * Math.sin(2 * Math.PI * wk * (f - 0.5)); }
   /* P takes the GEOMETRIC fraction along the edge; wobble is evaluated
    * there so both neighbors displace the same physical point equally. */
