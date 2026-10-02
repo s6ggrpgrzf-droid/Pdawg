@@ -1,0 +1,1420 @@
+/* ============================================================
+ * Pdawg Puzzles - a better jigsaw puzzle game.
+ * Single-canvas renderer, seeded Draradech-style piece edges,
+ * magnetic snap + piece grouping, IndexedDB autosave, custom photos.
+ * No dependencies, no network. Mobile-first (Pointer Events).
+ * ============================================================ */
+(function () {
+'use strict';
+
+/* ---------------- utilities ---------------- */
+function $(s) { return document.querySelector(s); }
+function el(tag, cls, html) {
+  var d = document.createElement(tag);
+  if (cls) d.className = cls;
+  if (html !== undefined) d.innerHTML = html;
+  return d;
+}
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+function fmtTime(ms) {
+  var s = Math.floor(ms / 1000);
+  var m = Math.floor(s / 60), h = Math.floor(m / 60);
+  s = s % 60; m = m % 60;
+  function p(n) { return (n < 10 ? '0' : '') + n; }
+  return h > 0 ? h + ':' + p(m) + ':' + p(s) : m + ':' + p(s);
+}
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hashStr(s) {
+  var h = 2166136261;
+  for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+function uid(prefix) {
+  return (prefix || 'p') + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
+}
+
+/* ---------------- piece-edge geometry (pure, testable) ----------------
+ * Edge table: v[r][c] = boundary between (r,c-1) and (r,c), c in 0..cols.
+ *             h[r][c] = boundary between (r-1,c) and (r,c), r in 0..rows.
+ * Sign: +1 = tab points right (v) / down (h). Borders = 0 (flat).
+ * Jitter tables vj/hj hold per-boundary random in [-1,1] so neighbors share
+ * the exact same curve -> pieces interlock perfectly.
+ */
+function buildEdges(rows, cols, rng) {
+  var v = [], h = [], vj = [], hj = [], r, c;
+  for (r = 0; r < rows; r++) {
+    v[r] = []; vj[r] = [];
+    for (c = 0; c <= cols; c++) {
+      var vb = (c === 0 || c === cols);
+      v[r][c] = vb ? 0 : (rng() < 0.5 ? -1 : 1);
+      vj[r][c] = vb ? 0 : rng() * 2 - 1;
+    }
+  }
+  for (r = 0; r <= rows; r++) {
+    h[r] = []; hj[r] = [];
+    for (c = 0; c < cols; c++) {
+      var hb = (r === 0 || r === rows);
+      h[r][c] = hb ? 0 : (rng() < 0.5 ? -1 : 1);
+      hj[r][c] = hb ? 0 : rng() * 2 - 1;
+    }
+  }
+  return { v: v, h: h, vj: vj, hj: hj };
+}
+
+/* Outward-positive edge signs + jitter for piece (r,c). */
+function pieceEdges(E, r, c) {
+  return {
+    top: -E.h[r][c], right: E.v[r][c + 1], bottom: E.h[r + 1][c], left: -E.v[r][c],
+    tj: E.hj[r][c], rj: E.vj[r][c + 1], bj: E.hj[r + 1][c], lj: E.vj[r][c]
+  };
+}
+
+/* Knob-curve ops for one edge from (x1,y1) to (x2,y2).
+ * Positive tab bulges toward the LEFT of the travel direction.
+ * The curve is mirror-symmetric about its midpoint, so tracing the same
+ * boundary in reverse with the opposite tab sign yields the identical
+ * geometric curve -> neighbor pieces interlock exactly. */
+function edgeGeom(x1, y1, x2, y2, tab, jit) {
+  if (tab === 0) return [{ t: 'l', p: [x2, y2] }];
+  var dx = x2 - x1, dy = y2 - y1;
+  var len = Math.hypot(dx, dy) || 1;
+  var nx = -dy / len, ny = dx / len;
+  var off = tab * (0.20 + 0.05 * jit);
+  function P(f, o) { return [x1 + dx * f + nx * len * o * off, y1 + dy * f + ny * len * o * off]; }
+  return [
+    { t: 'l', p: P(0.32, 0) },
+    { t: 'c', p: [P(0.40, 0.02), P(0.36, 0.10), P(0.42, 0.14)] },
+    { t: 'c', p: [P(0.46, 0.22), P(0.54, 0.22), P(0.58, 0.14)] },
+    { t: 'c', p: [P(0.64, 0.10), P(0.60, 0.02), P(0.68, 0)] },
+    { t: 'l', p: [x2, y2] }
+  ];
+}
+
+function strokeGeom(ctx, ops) {
+  for (var i = 0; i < ops.length; i++) {
+    var o = ops[i];
+    if (o.t === 'l') ctx.lineTo(o.p[0], o.p[1]);
+    else ctx.bezierCurveTo(o.p[0][0], o.p[0][1], o.p[1][0], o.p[1][1], o.p[2][0], o.p[2][1]);
+  }
+}
+
+/* Trace piece outline clockwise starting top-left of the cell. */
+function tracePiecePath(ctx, ox, oy, w, h, e) {
+  ctx.beginPath();
+  ctx.moveTo(ox, oy);
+  strokeGeom(ctx, edgeGeom(ox, oy, ox + w, oy, -e.top, e.tj));
+  strokeGeom(ctx, edgeGeom(ox + w, oy, ox + w, oy + h, -e.right, e.rj));
+  strokeGeom(ctx, edgeGeom(ox + w, oy + h, ox, oy + h, -e.bottom, e.bj));
+  strokeGeom(ctx, edgeGeom(ox, oy + h, ox, oy, -e.left, e.lj));
+  ctx.closePath();
+}
+
+/* Sample a cubic bezier (for tests). */
+function bezPoint(p0, p1, p2, p3, t) {
+  var u = 1 - t;
+  return [
+    u * u * u * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t * t * t * p3[0],
+    u * u * u * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t * t * t * p3[1]
+  ];
+}
+/* Flatten edge ops to a point polyline (for interlock tests). */
+function flattenEdgeOps(ops, x1, y1, n) {
+  var pts = [[x1, y1]], cur = [x1, y1];
+  for (var i = 0; i < ops.length; i++) {
+    var o = ops[i];
+    if (o.t === 'l') { pts.push(o.p); cur = o.p; }
+    else {
+      for (var k = 1; k <= n; k++) pts.push(bezPoint(cur, o.p[0], o.p[1], o.p[2], k / n));
+      cur = o.p[2];
+    }
+  }
+  return pts;
+}
+
+/* ---------------- storage: IndexedDB + shelf index ---------------- */
+var idb = {
+  db: null, mem: null,
+  open: function () {
+    var self = this;
+    return new Promise(function (resolve) {
+      if (!window.indexedDB) { self.mem = { puzzles: {}, images: {} }; resolve(); return; }
+      var req = window.indexedDB.open('pdawg', 1);
+      req.onupgradeneeded = function () {
+        var d = req.result;
+        if (!d.objectStoreNames.contains('puzzles')) d.createObjectStore('puzzles', { keyPath: 'id' });
+        if (!d.objectStoreNames.contains('images')) d.createObjectStore('images', { keyPath: 'id' });
+      };
+      req.onsuccess = function () { self.db = req.result; resolve(); };
+      req.onerror = function () { self.mem = { puzzles: {}, images: {} }; resolve(); };
+    });
+  },
+  _store: function (name, mode) { return this.db.transaction(name, mode).objectStore(name); },
+  put: function (name, val) {
+    var self = this;
+    return new Promise(function (resolve, reject) {
+      if (self.mem) { self.mem[name][val.id] = val; resolve(); return; }
+      var q = self._store(name, 'readwrite').put(val);
+      q.onsuccess = function () { resolve(); };
+      q.onerror = function () { reject(q.error); };
+    });
+  },
+  get: function (name, key) {
+    var self = this;
+    return new Promise(function (resolve, reject) {
+      if (self.mem) { resolve(self.mem[name][key] || null); return; }
+      var q = self._store(name, 'readonly').get(key);
+      q.onsuccess = function () { resolve(q.result || null); };
+      q.onerror = function () { reject(q.error); };
+    });
+  },
+  del: function (name, key) {
+    var self = this;
+    return new Promise(function (resolve, reject) {
+      if (self.mem) { delete self.mem[name][key]; resolve(); return; }
+      var q = self._store(name, 'readwrite').delete(key);
+      q.onsuccess = function () { resolve(); };
+      q.onerror = function () { reject(q.error); };
+    });
+  }
+};
+
+var shelf = {
+  KEY: 'pdawg-shelf-v1',
+  read: function () {
+    try { return JSON.parse(localStorage.getItem(this.KEY) || '[]'); }
+    catch (e) { return []; }
+  },
+  write: function (list) {
+    try { localStorage.setItem(this.KEY, JSON.stringify(list)); } catch (e) {}
+  },
+  upsert: function (entry) {
+    var list = this.read().filter(function (e) { return e.id !== entry.id; });
+    list.unshift(entry);
+    this.write(list.slice(0, 60));
+  },
+  remove: function (id) { this.write(this.read().filter(function (e) { return e.id !== id; })); }
+};
+
+var bests = {
+  KEY: 'pdawg-best-v1',
+  read: function () {
+    try { return JSON.parse(localStorage.getItem(this.KEY) || '{}'); }
+    catch (e) { return {}; }
+  },
+  get: function (key) { return this.read()[key] || null; },
+  set: function (key, ms) {
+    var b = this.read(); b[key] = ms;
+    try { localStorage.setItem(this.KEY, JSON.stringify(b)); } catch (e) {}
+  }
+};
+
+/* ---------------- puzzle setup ---------------- */
+var COUNTS = [24, 54, 108, 216, 432];
+
+function gridForCount(n, aspect) {
+  var cols = Math.max(2, Math.round(Math.sqrt(n * aspect)));
+  var rows = Math.max(2, Math.round(n / cols));
+  return { rows: rows, cols: cols };
+}
+
+/* Build a fresh puzzle state object (no DOM needed except piece canvases). */
+function newPuzzleState(opts) {
+  // opts: {id,title,imageKind,galleryIdx,imgW,imgH,rows,cols,seed,rotationOn}
+  var rng = mulberry32(opts.seed);
+  var E = buildEdges(opts.rows, opts.cols, rng);
+  var imgW = opts.imgW, imgH = opts.imgH;
+  var boardW = imgW * 2.3, boardH = imgH * 2.3;
+  var imgOX = (boardW - imgW) / 2, imgOY = (boardH - imgH) / 2;
+  var cellW = imgW / opts.cols, cellH = imgH / opts.rows;
+  var M = 0.28 * Math.min(cellW, cellH);
+  var pieces = [], groups = {}, zorder = [];
+  var gidN = 0;
+  for (var r = 0; r < opts.rows; r++) {
+    for (var c = 0; c < opts.cols; c++) {
+      var id = r * opts.cols + c;
+      var gid = 'g' + (gidN++);
+      // scatter: random board position outside the central image rect
+      var x, y, tries = 0;
+      do {
+        x = rng() * (boardW - cellW);
+        y = rng() * (boardH - cellH);
+        tries++;
+      } while (tries < 40 && x > imgOX - cellW && x < imgOX + imgW && y > imgOY - cellH && y < imgOY + imgH);
+      var rot = opts.rotationOn ? [0, 90, 180, 270][(rng() * 4) | 0] : 0;
+      pieces.push({ id: id, r: r, c: c, x: x, y: y, rot: rot, placed: false, gid: gid });
+      groups[gid] = [id];
+      zorder.push(gid);
+    }
+  }
+  // shuffle z-order so the scatter has no row/col bias
+  for (var i = zorder.length - 1; i > 0; i--) {
+    var j = (rng() * (i + 1)) | 0;
+    var t = zorder[i]; zorder[i] = zorder[j]; zorder[j] = t;
+  }
+  return {
+    id: opts.id, title: opts.title, imageKind: opts.imageKind,
+    galleryIdx: opts.galleryIdx === undefined ? -1 : opts.galleryIdx,
+    imageId: opts.imageId || null,
+    rows: opts.rows, cols: opts.cols, seed: opts.seed, rotationOn: !!opts.rotationOn,
+    imgW: imgW, imgH: imgH, boardW: boardW, boardH: boardH,
+    imgOX: imgOX, imgOY: imgOY, cellW: cellW, cellH: cellH, margin: M,
+    pieces: pieces, groups: groups, zorder: zorder,
+    elapsed: 0, won: false, updatedAt: Date.now(), thumb: opts.thumb || null,
+    edges: E
+  };
+}
+
+function trueX(p, S) { return S.imgOX + p.c * S.cellW; }
+function trueY(p, S) { return S.imgOY + p.r * S.cellH; }
+function snapDist(S) { return 0.32 * Math.min(S.cellW, S.cellH); }
+function isEdgePiece(p, S) {
+  return p.r === 0 || p.c === 0 || p.r === S.rows - 1 || p.c === S.cols - 1;
+}
+
+/* Render each piece's image (clipped to its path + baked shadow) to its own canvas. */
+function renderPieceCanvases(S, imgCanvas) {
+  var canvases = new Array(S.pieces.length);
+  var paths = new Array(S.pieces.length);
+  var M = S.margin, cw = S.cellW, ch = S.cellH;
+  var pw = Math.ceil(cw + 2 * M), ph = Math.ceil(ch + 2 * M);
+  for (var i = 0; i < S.pieces.length; i++) {
+    var p = S.pieces[i];
+    var e = pieceEdges(S.edges, p.r, p.c);
+    var cv = document.createElement('canvas');
+    cv.width = pw; cv.height = ph;
+    var c = cv.getContext('2d');
+    tracePiecePath(c, M, M, cw, ch, e);
+    c.save();
+    c.clip();
+    c.drawImage(imgCanvas, p.c * cw - M, p.r * ch - M, pw, ph, 0, 0, pw, ph);
+    c.restore();
+    // baked drop shadow + edge stroke
+    c.shadowColor = 'rgba(0,0,0,0.35)';
+    c.shadowBlur = Math.max(4, M * 0.55);
+    c.shadowOffsetY = 2;
+    tracePiecePath(c, M, M, cw, ch, e);
+    c.strokeStyle = 'rgba(0,0,0,0.30)';
+    c.lineWidth = Math.max(1.5, M * 0.12);
+    c.stroke();
+    c.shadowColor = 'transparent';
+    c.shadowBlur = 0; c.shadowOffsetY = 0;
+    tracePiecePath(c, M, M, cw, ch, e);
+    c.strokeStyle = 'rgba(255,255,255,0.10)';
+    c.lineWidth = 1;
+    c.stroke();
+    canvases[i] = cv;
+    var path = new Path2D();
+    var pc = { beginPath: function () { path = new Path2D(); }, moveTo: function (x, y) { path.moveTo(x, y); }, lineTo: function (x, y) { path.lineTo(x, y); }, bezierCurveTo: function (a, b, cc, d, ee, f) { path.bezierCurveTo(a, b, cc, d, ee, f); }, closePath: function () { path.closePath(); } };
+    tracePiecePath(pc, M, M, cw, ch, e);
+    paths[i] = path;
+  }
+  return { canvases: canvases, paths: paths };
+}
+
+/* Serialize for IndexedDB (edges rebuild from seed; canvases rebuilt from image). */
+function serializeState(S) {
+  return {
+    id: S.id, title: S.title, imageKind: S.imageKind, galleryIdx: S.galleryIdx,
+    imageId: S.imageId, rows: S.rows, cols: S.cols, seed: S.seed,
+    rotationOn: S.rotationOn, imgW: S.imgW, imgH: S.imgH,
+    pieces: S.pieces.map(function (p) {
+      return { id: p.id, x: Math.round(p.x * 10) / 10, y: Math.round(p.y * 10) / 10, rot: p.rot, placed: p.placed, gid: p.gid };
+    }),
+    groups: S.groups, zorder: S.zorder,
+    elapsed: Math.round(S.elapsed), won: S.won,
+    updatedAt: Date.now(), thumb: S.thumb
+  };
+}
+
+/* Restore a saved state; fills migration-safe defaults for older saves. */
+function deserializeState(saved) {
+  var d = {
+    imageKind: 'gallery', galleryIdx: 0, imageId: null, rotationOn: false,
+    thumb: null, won: false, elapsed: 0, title: 'Puzzle'
+  };
+  for (var k in saved) d[k] = saved[k];
+  var rng = mulberry32(d.seed);
+  // Rebuild the edge table from the seed. buildEdges is always called first
+  // with a fresh PRNG stream (both here and in newPuzzleState), so the table
+  // is identical to the one used at creation. Piece positions come from the
+  // save itself, so the later scatter stream is not needed.
+  var E = buildEdges(d.rows, d.cols, rng);
+  var imgW = d.imgW, imgH = d.imgH;
+  var boardW = imgW * 2.3, boardH = imgH * 2.3;
+  var S = {
+    id: d.id, title: d.title, imageKind: d.imageKind, galleryIdx: d.galleryIdx,
+    imageId: d.imageId, rows: d.rows, cols: d.cols, seed: d.seed, rotationOn: !!d.rotationOn,
+    imgW: imgW, imgH: imgH, boardW: boardW, boardH: boardH,
+    imgOX: (boardW - imgW) / 2, imgOY: (boardH - imgH) / 2,
+    cellW: imgW / d.cols, cellH: imgH / d.rows,
+    margin: 0.28 * Math.min(imgW / d.cols, imgH / d.rows),
+    pieces: [], groups: d.groups || {}, zorder: d.zorder || [],
+    elapsed: d.elapsed || 0, won: !!d.won, updatedAt: d.updatedAt || Date.now(),
+    thumb: d.thumb || null, edges: E
+  };
+  for (var i = 0; i < d.pieces.length; i++) {
+    var sp = d.pieces[i];
+    var r = (sp.id / d.cols) | 0, c = sp.id % d.cols;
+    S.pieces.push({
+      id: sp.id, r: r, c: c,
+      x: sp.x === undefined ? 0 : sp.x, y: sp.y === undefined ? 0 : sp.y,
+      rot: sp.rot || 0, placed: !!sp.placed, gid: sp.gid || null
+    });
+  }
+  return S;
+}
+
+/* ---------------- snap + grouping (pure logic over state) ---------------- */
+function groupMembers(S, gid) {
+  var ids = S.groups[gid] || [];
+  var out = [];
+  for (var i = 0; i < ids.length; i++) out.push(S.pieces[ids[i]]);
+  return out;
+}
+
+function mergeGroups(S, gidA, gidB) {
+  if (gidA === gidB) return gidA;
+  var a = S.groups[gidA] || [], b = S.groups[gidB] || [];
+  for (var i = 0; i < b.length; i++) { S.pieces[b[i]].gid = gidA; a.push(b[i]); }
+  S.groups[gidA] = a;
+  delete S.groups[gidB];
+  S.zorder = S.zorder.filter(function (g) { return g !== gidB; });
+  if (S.zorder.indexOf(gidA) < 0) S.zorder.push(gidA);
+  return gidA;
+}
+
+function neighborsOf(p, S) {
+  var out = [];
+  if (p.r > 0) out.push(S.pieces[(p.r - 1) * S.cols + p.c]);
+  if (p.r < S.rows - 1) out.push(S.pieces[(p.r + 1) * S.cols + p.c]);
+  if (p.c > 0) out.push(S.pieces[p.r * S.cols + p.c - 1]);
+  if (p.c < S.cols - 1) out.push(S.pieces[p.r * S.cols + p.c + 1]);
+  return out;
+}
+
+/* After a drop: fuse relatively-correct neighbors, then lock the group if
+ * it sits on its true board position. Returns {merged, placed}. */
+function snapAfterDrop(S, gid) {
+  var sd = snapDist(S), merged = false, placed = false;
+  var changed = true, guard = 0;
+  while (changed && guard++ < 10) {
+    changed = false;
+    var members = groupMembers(S, gid);
+    for (var i = 0; i < members.length; i++) {
+      var p = members[i];
+      var ns = neighborsOf(p, S);
+      for (var j = 0; j < ns.length; j++) {
+        var q = ns[j];
+        if (q.placed || q.gid === gid) continue;
+        if (S.rotationOn && q.rot !== p.rot) continue;
+        var dx = (q.x - p.x) - (trueX(q, S) - trueX(p, S));
+        var dy = (q.y - p.y) - (trueY(q, S) - trueY(p, S));
+        if (Math.hypot(dx, dy) < sd) {
+          gid = mergeGroups(S, gid, q.gid);
+          merged = true; changed = true;
+        }
+      }
+    }
+  }
+  // absolute placement: whole group locks when a member is home
+  members = groupMembers(S, gid);
+  for (var k = 0; k < members.length; k++) {
+    var m = members[k];
+    if (Math.hypot(m.x - trueX(m, S), m.y - trueY(m, S)) < sd &&
+        (!S.rotationOn || m.rot % 360 === 0)) {
+      var all = groupMembers(S, gid);
+      for (var a = 0; a < all.length; a++) {
+        all[a].x = trueX(all[a], S); all[a].y = trueY(all[a], S);
+        all[a].rot = 0; all[a].placed = true; all[a].gid = null;
+      }
+      delete S.groups[gid];
+      S.zorder = S.zorder.filter(function (g) { return g !== gid; });
+      placed = true;
+      break;
+    }
+  }
+  return { merged: merged, placed: placed };
+}
+
+/* Rotate a whole group 90deg clockwise about its centroid. */
+function rotateGroup(S, gid) {
+  var members = groupMembers(S, gid);
+  if (!members.length) return;
+  var cx = 0, cy = 0;
+  for (var i = 0; i < members.length; i++) {
+    cx += members[i].x + S.cellW / 2; cy += members[i].y + S.cellH / 2;
+  }
+  cx /= members.length; cy /= members.length;
+  for (var j = 0; j < members.length; j++) {
+    var p = members[j];
+    var vx = (p.x + S.cellW / 2) - cx, vy = (p.y + S.cellH / 2) - cy;
+    var nx = cx - vy, ny = cy + vx; // CW in y-down coords
+    p.x = clamp(nx - S.cellW / 2, 0, S.boardW - S.cellW);
+    p.y = clamp(ny - S.cellH / 2, 0, S.boardH - S.cellH);
+    p.rot = (p.rot + 90) % 360;
+  }
+}
+
+function placedCount(S) {
+  var n = 0;
+  for (var i = 0; i < S.pieces.length; i++) if (S.pieces[i].placed) n++;
+  return n;
+}
+function isComplete(S) { return placedCount(S) === S.pieces.length; }
+
+/* ---------------- game controller: canvas, camera, render ---------------- */
+var Game = {
+  S: null, imgCanvas: null,
+  pieceCv: [], piecePaths: [],
+  canvas: null, ctx: null, hitCtx: null,
+  cam: { x: 0, y: 0, s: 1 },
+  dpr: 1, cw: 0, ch: 0,
+  dirty: true, raf: 0, lastT: 0,
+  selection: null, ghost: 0.15, edgeHi: false,
+  paused: false, confetti: null,
+  pointers: new Map(), gesture: null, downInfo: null,
+  saveTimer: 0,
+
+  init: function () {
+    this.canvas = $('#board');
+    this.ctx = this.canvas.getContext('2d');
+    var hc = document.createElement('canvas');
+    hc.width = 1; hc.height = 1;
+    this.hitCtx = hc.getContext('2d');
+    this.bindInput();
+    window.addEventListener('resize', this.resize.bind(this));
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden) Game.saveNow();
+    });
+    window.addEventListener('pagehide', function () { Game.saveNow(); });
+  },
+
+  resize: function () {
+    var wrap = $('#game');
+    this.dpr = Math.min(2.5, window.devicePixelRatio || 1);
+    this.cw = wrap.clientWidth; this.ch = wrap.clientHeight;
+    this.canvas.width = Math.round(this.cw * this.dpr);
+    this.canvas.height = Math.round(this.ch * this.dpr);
+    this.canvas.style.width = this.cw + 'px';
+    this.canvas.style.height = this.ch + 'px';
+    this.dirty = true;
+  },
+
+  fitBoard: function () {
+    var S = this.S;
+    if (!S) return;
+    var s = Math.min(this.cw / S.boardW, this.ch / S.boardH) * 0.985;
+    this.cam.s = s;
+    this.cam.x = S.boardW / 2;
+    this.cam.y = S.boardH / 2;
+    this.dirty = true;
+  },
+
+  toBoard: function (sx, sy) {
+    return {
+      x: this.cam.x + (sx - this.cw / 2) / this.cam.s,
+      y: this.cam.y + (sy - this.ch / 2) / this.cam.s
+    };
+  },
+
+  start: function (S, imgCanvas) {
+    this.S = S;
+    this.imgCanvas = imgCanvas;
+    var rc = renderPieceCanvases(S, imgCanvas);
+    this.pieceCv = rc.canvases;
+    this.piecePaths = rc.paths;
+    this.selection = null;
+    this.paused = false;
+    this.confetti = null;
+    this.ghost = 0.15; this.edgeHi = false;
+    $('#ghostRange').value = 15;
+    $('#edgeBtn').classList.remove('on');
+    this.resize();
+    this.fitBoard();
+    this.lastT = performance.now();
+    $('#timer').textContent = fmtTime(S.elapsed);
+    $('#puzzleTitle').textContent = S.title;
+    cancelAnimationFrame(this.raf);
+    var self = this;
+    function loop(t) {
+      self.frame(t);
+      self.raf = requestAnimationFrame(loop);
+    }
+    this.raf = requestAnimationFrame(loop);
+    this.markDirty();
+    this.updateProgress();
+  },
+
+  stop: function () {
+    cancelAnimationFrame(this.raf);
+    this.raf = 0;
+    this.saveNow();
+    this.S = null;
+  },
+
+  markDirty: function () { this.dirty = true; },
+
+  frame: function (t) {
+    var dt = t - this.lastT;
+    this.lastT = t;
+    var S = this.S;
+    if (S && !this.paused && !S.won) {
+      S.elapsed += dt;
+      if (!this._tick || t - this._tick > 500) {
+        this._tick = t;
+        $('#timer').textContent = fmtTime(S.elapsed);
+      }
+    }
+    if (this.confetti) this.updateConfetti(dt);
+    if (this.dirty) { this.draw(); this.dirty = false; }
+    else if (this.confetti) { this.draw(); }
+  },
+
+  draw: function () {
+    var S = this.S, ctx = this.ctx;
+    if (!S) return;
+    var dpr = this.dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, this.cw, this.ch);
+    ctx.fillStyle = '#14161f';
+    ctx.fillRect(0, 0, this.cw, this.ch);
+    var s = this.cam.s;
+    ctx.setTransform(dpr * s, 0, 0, dpr * s,
+      dpr * (this.cw / 2 - this.cam.x * s),
+      dpr * (this.ch / 2 - this.cam.y * s));
+    // board backdrop
+    ctx.fillStyle = '#1c1f2b';
+    ctx.fillRect(0, 0, S.boardW, S.boardH);
+    // ghost image
+    if (this.ghost > 0.005) {
+      ctx.save();
+      ctx.globalAlpha = this.ghost;
+      ctx.drawImage(this.imgCanvas, S.imgOX, S.imgOY, S.imgW, S.imgH);
+      ctx.restore();
+    }
+    // image frame outline
+    ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+    ctx.lineWidth = 2 / s;
+    ctx.strokeRect(S.imgOX, S.imgOY, S.imgW, S.imgH);
+    // placed pieces first
+    var i, p;
+    for (i = 0; i < S.pieces.length; i++) {
+      p = S.pieces[i];
+      if (p.placed) this.drawPiece(p, false);
+    }
+    // loose groups in z-order
+    for (i = 0; i < S.zorder.length; i++) {
+      var members = groupMembers(S, S.zorder[i]);
+      for (var j = 0; j < members.length; j++) {
+        var dim = this.edgeHi && !isEdgePiece(members[j], S);
+        this.drawPiece(members[j], dim);
+      }
+    }
+    // selection highlight
+    if (this.selection && S.groups[this.selection]) {
+      var ms = groupMembers(S, this.selection);
+      var x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+      for (var k = 0; k < ms.length; k++) {
+        x0 = Math.min(x0, ms[k].x - S.margin); y0 = Math.min(y0, ms[k].y - S.margin);
+        x1 = Math.max(x1, ms[k].x + S.cellW + S.margin); y1 = Math.max(y1, ms[k].y + S.cellH + S.margin);
+      }
+      ctx.save();
+      ctx.strokeStyle = '#ffd166';
+      ctx.lineWidth = 3 / s;
+      ctx.setLineDash([10 / s, 7 / s]);
+      ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+      ctx.restore();
+    }
+    // confetti (screen space)
+    if (this.confetti) {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      var ps = this.confetti;
+      for (var cI = 0; cI < ps.length; cI++) {
+        var pt = ps[cI];
+        ctx.save();
+        ctx.translate(pt.x, pt.y);
+        ctx.rotate(pt.rot);
+        ctx.fillStyle = pt.color;
+        ctx.globalAlpha = Math.max(0, pt.life);
+        ctx.fillRect(-4, -2.5, 8, 5);
+        ctx.restore();
+      }
+      ctx.globalAlpha = 1;
+    }
+  },
+
+  drawPiece: function (p, dim) {
+    var S = this.S;
+    var cv = this.pieceCv[p.id];
+    var M = S.margin;
+    var cx = p.x + S.cellW / 2, cy = p.y + S.cellH / 2;
+    var ctx = this.ctx;
+    ctx.save();
+    if (dim) ctx.globalAlpha = 0.32;
+    ctx.translate(cx, cy);
+    if (p.rot) ctx.rotate(p.rot * Math.PI / 180);
+    ctx.drawImage(cv, -(S.cellW / 2 + M), -(S.cellH / 2 + M), S.cellW + 2 * M, S.cellH + 2 * M);
+    ctx.restore();
+  },
+
+  updateConfetti: function (dt) {
+    var ps = this.confetti, alive = false;
+    var cols = ['#ffd166', '#ef476f', '#06d6a0', '#118ab2', '#f78c6b', '#ffffff'];
+    if (!this._confInit) {
+      this._confInit = true;
+      for (var i = 0; i < 160; i++) {
+        ps.push({
+          x: Math.random() * this.cw, y: -20 - Math.random() * this.ch * 0.5,
+          vx: (Math.random() - 0.5) * 120, vy: 120 + Math.random() * 220,
+          rot: Math.random() * 6.28, vr: (Math.random() - 0.5) * 10,
+          color: cols[(Math.random() * cols.length) | 0], life: 1
+        });
+      }
+    }
+    for (var j = 0; j < ps.length; j++) {
+      var p = ps[j];
+      p.x += p.vx * dt / 1000; p.y += p.vy * dt / 1000;
+      p.rot += p.vr * dt / 1000;
+      if (p.y > this.ch + 30) p.life -= dt / 800;
+      if (p.life > 0) alive = true;
+    }
+    if (!alive) { this.confetti = null; this._confInit = false; }
+    this.dirty = true;
+  },
+
+  updateProgress: function () {
+    var S = this.S;
+    if (!S) return;
+    var n = placedCount(S), total = S.pieces.length;
+    $('#prog').textContent = n + ' / ' + total + '  (' + Math.round(n / total * 100) + '%)';
+  }
+};
+
+/* ---------------- input: drag / pan / pinch / tap ---------------- */
+Game.bindInput = function () {
+  var cv = this.canvas, self = this;
+  cv.style.touchAction = 'none';
+  cv.addEventListener('pointerdown', function (e) { self.onDown(e); });
+  cv.addEventListener('pointermove', function (e) { self.onMove(e); });
+  cv.addEventListener('pointerup', function (e) { self.onUp(e); });
+  cv.addEventListener('pointercancel', function (e) { self.onUp(e); });
+  cv.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  // double-tap detection
+  cv.addEventListener('pointerdown', function (e) {
+    var now = performance.now();
+    if (self._lastTap && now - self._lastTap.t < 350 &&
+        Math.hypot(e.clientX - self._lastTap.x, e.clientY - self._lastTap.y) < 28) {
+      self.onDoubleTap(e);
+      self._lastTap = null;
+    }
+  });
+};
+
+Game.hitTest = function (bx, by) {
+  var S = this.S;
+  if (!S) return null;
+  var M = S.margin;
+  for (var i = S.zorder.length - 1; i >= 0; i--) {
+    var members = groupMembers(S, S.zorder[i]);
+    for (var j = members.length - 1; j >= 0; j--) {
+      var p = members[j];
+      var lx = bx - (p.x - M), ly = by - (p.y - M);
+      if (p.rot) {
+        var cx = M + S.cellW / 2, cy = M + S.cellH / 2;
+        var a = -p.rot * Math.PI / 180;
+        var dx = lx - cx, dy = ly - cy;
+        lx = cx + dx * Math.cos(a) - dy * Math.sin(a);
+        ly = cy + dx * Math.sin(a) + dy * Math.cos(a);
+      }
+      if (lx < -2 || ly < -2 || lx > S.cellW + 2 * M + 2 || ly > S.cellH + 2 * M + 2) continue;
+      this.hitCtx.setTransform(1, 0, 0, 1, 0, 0);
+      if (this.hitCtx.isPointInPath(this.piecePaths[p.id], lx, ly)) return p;
+    }
+  }
+  return null;
+};
+
+Game.onDown = function (e) {
+  if (!this.S || this.paused || this.S.won) return;
+  e.preventDefault();
+  try { this.canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  var now = performance.now();
+  this.downInfo = { x: e.clientX, y: e.clientY, t: now, moved: false, tapDone: false };
+  if (this.pointers.size === 2) {
+    // switch to pinch
+    var pts = Array.from(this.pointers.values());
+    var b0 = this.toBoard(pts[0].x, pts[0].y), b1 = this.toBoard(pts[1].x, pts[1].y);
+    this.gesture = {
+      type: 'pinch',
+      d0: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y),
+      s0: this.cam.s,
+      mx: (pts[0].x + pts[1].x) / 2, my: (pts[0].y + pts[1].y) / 2,
+      bx: (b0.x + b1.x) / 2, by: (b0.y + b1.y) / 2
+    };
+    return;
+  }
+  if (this.pointers.size > 2) return;
+  var b = this.toBoard(e.clientX, e.clientY);
+  var hit = this.hitTest(b.x, b.y);
+  if (hit) {
+    var gid = hit.gid;
+    // bring to front
+    var S = this.S;
+    S.zorder = S.zorder.filter(function (g) { return g !== gid; });
+    S.zorder.push(gid);
+    var members = groupMembers(S, gid);
+    this.gesture = {
+      type: 'drag', gid: gid,
+      startBX: b.x, startBY: b.y,
+      orig: members.map(function (p) { return { p: p, x: p.x, y: p.y }; })
+    };
+    this.selection = gid;
+    this.updateRotateBtn();
+  } else {
+    this.gesture = {
+      type: 'pan',
+      startX: e.clientX, startY: e.clientY,
+      camX: this.cam.x, camY: this.cam.y
+    };
+  }
+  this.markDirty();
+};
+
+Game.onMove = function (e) {
+  if (!this.pointers.has(e.pointerId)) return;
+  this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  var g = this.gesture;
+  if (this.downInfo && Math.hypot(e.clientX - this.downInfo.x, e.clientY - this.downInfo.y) > 10) {
+    this.downInfo.moved = true;
+  }
+  if (!g) return;
+  if (g.type === 'drag') {
+    var b = this.toBoard(e.clientX, e.clientY);
+    var dx = b.x - g.startBX, dy = b.y - g.startBY;
+    for (var i = 0; i < g.orig.length; i++) {
+      var o = g.orig[i];
+      o.p.x = clamp(o.x + dx, -this.S.cellW * 0.4, this.S.boardW - this.S.cellW * 0.6);
+      o.p.y = clamp(o.y + dy, -this.S.cellH * 0.4, this.S.boardH - this.S.cellH * 0.6);
+    }
+    this.markDirty();
+  } else if (g.type === 'pan') {
+    this.cam.x = g.camX - (e.clientX - g.startX) / this.cam.s;
+    this.cam.y = g.camY - (e.clientY - g.startY) / this.cam.s;
+    this.clampCam();
+    this.markDirty();
+  } else if (g.type === 'pinch' && this.pointers.size >= 2) {
+    var pts = Array.from(this.pointers.values());
+    var d = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1;
+    var ns = clamp(g.s0 * d / g.d0, this.minZoom(), this.maxZoom());
+    var mx = (pts[0].x + pts[1].x) / 2, my = (pts[0].y + pts[1].y) / 2;
+    // keep the original midpoint's board point under the fingers
+    this.cam.s = ns;
+    this.cam.x = g.bx - (mx - this.cw / 2) / ns;
+    this.cam.y = g.by - (my - this.ch / 2) / ns;
+    this.clampCam();
+    this.markDirty();
+  }
+};
+
+Game.minZoom = function () {
+  var S = this.S;
+  return Math.min(this.cw / S.boardW, this.ch / S.boardH) * 0.7;
+};
+Game.maxZoom = function () {
+  var S = this.S;
+  return Math.max(2.2, 900 / Math.min(S.cellW, S.cellH));
+};
+Game.clampCam = function () {
+  var S = this.S;
+  this.cam.s = clamp(this.cam.s, this.minZoom(), this.maxZoom());
+  var vw = this.cw / this.cam.s / 2, vh = this.ch / this.cam.s / 2;
+  this.cam.x = clamp(this.cam.x, -vw * 0.4, S.boardW + vw * 0.4);
+  this.cam.y = clamp(this.cam.y, -vh * 0.4, S.boardH + vh * 0.4);
+};
+
+Game.onUp = function (e) {
+  var wasTap = this.downInfo && !this.downInfo.moved &&
+    (performance.now() - this.downInfo.t) < 350 && this.pointers.size === 1;
+  this.pointers.delete(e.pointerId);
+  var g = this.gesture;
+  if (g && g.type === 'drag' && this.pointers.size === 0) {
+    var res = snapAfterDrop(this.S, g.gid);
+    if (res.merged || res.placed) {
+      this.updateProgress();
+      if (res.placed) this.checkWin();
+    }
+    this.scheduleSave();
+    this.markDirty();
+  }
+  if (this.pointers.size === 0) {
+    if (wasTap && g) this.onTap(e, g);
+    this.gesture = null;
+  } else if (this.pointers.size === 1 && g && g.type === 'pinch') {
+    // pinch ended with one finger left: start fresh pan on next move
+    var pts = Array.from(this.pointers.values());
+    this.gesture = {
+      type: 'pan', startX: pts[0].x, startY: pts[0].y,
+      camX: this.cam.x, camY: this.cam.y
+    };
+  }
+  this.downInfo = null;
+};
+
+Game.onTap = function (e, g) {
+  var S = this.S;
+  if (!S || this._dblFired) { this._dblFired = false; return; }
+  this._lastTap = { x: e.clientX, y: e.clientY, t: performance.now() };
+  var b = this.toBoard(e.clientX, e.clientY);
+  if (g.type === 'drag') {
+    // tapped a piece: select it (already set on down)
+    this.markDirty();
+  } else {
+    // tapped empty space: move selection there, or deselect
+    if (this.selection && S.groups[this.selection]) {
+      var members = groupMembers(S, this.selection);
+      var cx = 0, cy = 0;
+      for (var i = 0; i < members.length; i++) {
+        cx += members[i].x + S.cellW / 2; cy += members[i].y + S.cellH / 2;
+      }
+      cx /= members.length; cy /= members.length;
+      var dx = clamp(b.x, 0, S.boardW) - cx, dy = clamp(b.y, 0, S.boardH) - cy;
+      for (var j = 0; j < members.length; j++) {
+        members[j].x = clamp(members[j].x + dx, -S.cellW * 0.4, S.boardW - S.cellW * 0.6);
+        members[j].y = clamp(members[j].y + dy, -S.cellH * 0.4, S.boardH - S.cellH * 0.6);
+      }
+      var res = snapAfterDrop(S, this.selection);
+      if (res.placed) this.checkWin();
+      this.updateProgress();
+      this.scheduleSave();
+    } else {
+      this.selection = null;
+      this.updateRotateBtn();
+    }
+    this.markDirty();
+  }
+};
+
+Game.onDoubleTap = function (e) {
+  var S = this.S;
+  if (!S || !S.rotationOn || this.paused || S.won) return;
+  var b = this.toBoard(e.clientX, e.clientY);
+  var hit = this.hitTest(b.x, b.y);
+  if (hit) {
+    this._dblFired = true;
+    this._lastTap = null;
+    rotateGroup(S, hit.gid);
+    this.scheduleSave();
+    this.markDirty();
+  }
+};
+
+Game.rotateSelection = function () {
+  var S = this.S;
+  if (!S || !S.rotationOn) return;
+  var gid = this.selection && S.groups[this.selection] ? this.selection : null;
+  if (!gid) { toast('Tap a piece first, then rotate'); return; }
+  rotateGroup(S, gid);
+  this.scheduleSave();
+  this.markDirty();
+};
+
+Game.updateRotateBtn = function () {
+  var btn = $('#rotBtn');
+  if (!this.S || !this.S.rotationOn) { btn.style.display = 'none'; return; }
+  btn.style.display = '';
+  btn.classList.toggle('on', !!(this.selection && this.S.groups[this.selection]));
+};
+
+/* Gallery access that works in browser and Node (tests). */
+function getGallery() {
+  if (typeof window !== 'undefined' && window.PDAWG_GALLERY) return window.PDAWG_GALLERY;
+  if (typeof require !== 'undefined') {
+    try { return require('./gallery.js'); } catch (e) { /* ignore */ }
+  }
+  return null;
+}
+
+/* ---------------- persistence + win ---------------- */
+Game.scheduleSave = function () {
+  clearTimeout(this.saveTimer);
+  var self = this;
+  this.saveTimer = setTimeout(function () { self.saveNow(); }, 2000);
+};
+
+Game.saveNow = function () {
+  var S = this.S;
+  if (!S) return;
+  clearTimeout(this.saveTimer);
+  var data = serializeState(S);
+  var self = this;
+  idb.put('puzzles', data).then(function () {
+    var n = placedCount(S), total = S.pieces.length;
+    shelf.upsert({
+      id: S.id, title: S.title, thumb: S.thumb,
+      rows: S.rows, cols: S.cols,
+      pct: Math.round(n / total * 100),
+      updatedAt: Date.now(), imageKind: S.imageKind, galleryIdx: S.galleryIdx,
+      rotationOn: S.rotationOn, done: S.won
+    });
+    if (typeof UI !== 'undefined') UI.renderShelf();
+  }).catch(function () {});
+};
+
+Game.bestKey = function () {
+  var S = this.S;
+  var imgKey = S.imageKind === 'gallery' ? 'g' + S.galleryIdx : (S.imageKind === 'daily' ? 'daily' : 'custom');
+  return imgKey + ':' + S.rows + 'x' + S.cols + ':r' + (S.rotationOn ? 1 : 0);
+};
+
+Game.checkWin = function () {
+  var S = this.S;
+  if (!S || S.won || !isComplete(S)) return;
+  S.won = true;
+  this.selection = null;
+  this.confetti = [];
+  this._confInit = false;
+  var key = this.bestKey();
+  var prev = bests.get(key);
+  var isBest = !prev || S.elapsed < prev;
+  if (isBest) bests.set(key, Math.round(S.elapsed));
+  this.saveNow();
+  // daily completion
+  if (S.imageKind === 'daily') {
+    try { localStorage.setItem('pdawg-daily', JSON.stringify({ date: dailyStr(), ms: Math.round(S.elapsed) })); } catch (e) {}
+  }
+  var self = this;
+  setTimeout(function () { UI.showWin(isBest, prev); }, 900);
+  this.markDirty();
+};
+
+/* ---------------- image loading ---------------- */
+function loadImageCanvas(S) {
+  // returns Promise<canvas> of imgW x imgH
+  return new Promise(function (resolve, reject) {
+    var cv = document.createElement('canvas');
+    cv.width = Math.round(S.imgW); cv.height = Math.round(S.imgH);
+    var cx = cv.getContext('2d');
+    if (S.imageKind === 'gallery' || S.imageKind === 'daily') {
+      var idx = S.galleryIdx;
+      var src = getGallery().paint(idx, Math.round(S.imgW), Math.round(S.imgH), 1234);
+      cx.drawImage(src, 0, 0, cv.width, cv.height);
+      resolve(cv);
+    } else {
+      idb.get('images', S.imageId).then(function (rec) {
+        if (!rec) { reject(new Error('image missing')); return; }
+        imageBlobToBitmap(rec.blob).then(function (bmp) {
+          cx.drawImage(bmp, 0, 0, cv.width, cv.height);
+          resolve(cv);
+        }).catch(reject);
+      }).catch(reject);
+    }
+  });
+}
+
+function imageBlobToBitmap(blob) {
+  if (window.createImageBitmap) return window.createImageBitmap(blob);
+  return new Promise(function (resolve, reject) {
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    img.onload = function () {
+      var cv = document.createElement('canvas');
+      cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+      cv.getContext('2d').drawImage(img, 0, 0);
+      URL.revokeObjectURL(url);
+      resolve(cv);
+    };
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+function fileToImageRecord(file) {
+  return imageBlobToBitmap(file).then(function (bmp) {
+    var w = bmp.width, h = bmp.height;
+    var maxDim = 1600;
+    var sc = Math.min(1, maxDim / Math.max(w, h));
+    w = Math.round(w * sc); h = Math.round(h * sc);
+    var cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    cv.getContext('2d').drawImage(bmp, 0, 0, w, h);
+    return new Promise(function (resolve, reject) {
+      cv.toBlob(function (blob) {
+        if (!blob) { reject(new Error('encode failed')); return; }
+        resolve({ blob: blob, w: w, h: h });
+      }, 'image/jpeg', 0.85);
+    });
+  });
+}
+
+function makeThumb(imgCanvas) {
+  var tw = 168, th = Math.round(168 * imgCanvas.height / imgCanvas.width);
+  var cv = document.createElement('canvas');
+  cv.width = tw; cv.height = th;
+  cv.getContext('2d').drawImage(imgCanvas, 0, 0, tw, th);
+  return cv.toDataURL('image/jpeg', 0.7);
+}
+
+/* ---------------- daily ---------------- */
+function dailyStr(d) {
+  d = d || new Date();
+  return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
+}
+function dailySpec(dateStr) {
+  var n = hashStr('pdawg-daily-' + (dateStr || dailyStr()));
+  var g = getGallery().GALLERY;
+  return {
+    id: 'daily-' + (dateStr || dailyStr()),
+    galleryIdx: n % g.length,
+    count: COUNTS[(n >>> 4) % COUNTS.length],
+    title: g[n % g.length].title + ' (Daily)'
+  };
+}
+function dailyDone(dateStr) {
+  try {
+    var d = JSON.parse(localStorage.getItem('pdawg-daily') || 'null');
+    return d && d.date === (dateStr || dailyStr()) ? d : null;
+  } catch (e) { return null; }
+}
+
+/* ---------------- UI: home, modals, toolbar ---------------- */
+function toast(msg) {
+  var t = $('#toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._tm);
+  t._tm = setTimeout(function () { t.classList.remove('show'); }, 2200);
+}
+
+function openModal(id) { $(id).classList.add('open'); }
+function closeModal(id) { $(id).classList.remove('open'); }
+
+var UI = {
+  galleryThumbs: [],
+
+  showHome: function () {
+    $('#home').style.display = '';
+    $('#game').style.display = 'none';
+    document.body.classList.remove('playing');
+    this.renderDaily();
+    this.renderShelf();
+    this.renderGallery();
+  },
+
+  showGame: function () {
+    $('#home').style.display = 'none';
+    $('#game').style.display = '';
+    document.body.classList.add('playing');
+  },
+
+  renderDaily: function () {
+    var spec = dailySpec();
+    var done = dailyDone();
+    var wrap = $('#dailyCard');
+    var thumb = this.galleryThumbs[spec.galleryIdx];
+    wrap.innerHTML = '';
+    var tag = el('div', 'card-tag', 'DAILY PUZZLE');
+    var title = el('div', 'card-title', window.PDAWG_GALLERY.GALLERY[spec.galleryIdx].title);
+    var sub = el('div', 'card-sub', spec.count + ' pieces' + (done ? ' &nbsp;·&nbsp; done in ' + fmtTime(done.ms) : ''));
+    var btn = el('button', 'btn primary', done ? 'Play again' : 'Play today');
+    if (thumb) { var im = el('div', 'card-thumb'); im.appendChild(thumb.cloneNode()); wrap.appendChild(im); }
+    var tx = el('div', 'card-text');
+    tx.appendChild(tag); tx.appendChild(title); tx.appendChild(sub);
+    wrap.appendChild(tx); wrap.appendChild(btn);
+    btn.onclick = function () { UI.startDaily(); };
+    wrap.onclick = function (e) { if (e.target !== btn) UI.startDaily(); };
+  },
+
+  renderShelf: function () {
+    var list = shelf.read().filter(function (e) { return !e.done; });
+    var sec = $('#shelfSection'), row = $('#shelfRow');
+    row.innerHTML = '';
+    if (!list.length) { sec.style.display = 'none'; return; }
+    sec.style.display = '';
+    list.forEach(function (e) {
+      var card = el('div', 'shelf-card');
+      var im = el('img', 'shelf-thumb'); im.src = e.thumb || ''; im.alt = '';
+      var tt = el('div', 'shelf-title', e.title);
+      var pc = el('div', 'shelf-pct', (e.pct || 0) + '%');
+      var bar = el('div', 'shelf-bar'); bar.appendChild(el('div', 'shelf-fill'));
+      bar.firstChild.style.width = (e.pct || 0) + '%';
+      var del = el('button', 'shelf-del', '×');
+      del.title = 'Delete';
+      del.onclick = function (ev) {
+        ev.stopPropagation();
+        if (confirm('Delete "' + e.title + '"?')) {
+          idb.del('puzzles', e.id).then(function () { shelf.remove(e.id); UI.renderShelf(); });
+        }
+      };
+      card.appendChild(im); card.appendChild(tt); card.appendChild(pc); card.appendChild(bar); card.appendChild(del);
+      card.onclick = function () { UI.resumePuzzle(e.id); };
+      row.appendChild(card);
+    });
+  },
+
+  renderGallery: function () {
+    var grid = $('#galleryGrid');
+    if (grid.children.length) return;
+    var self = this;
+    window.PDAWG_GALLERY.GALLERY.forEach(function (g, i) {
+      var card = el('div', 'gal-card');
+      var th = self.galleryThumbs[i];
+      if (th) card.appendChild(th.cloneNode());
+      card.appendChild(el('div', 'gal-title', g.title));
+      card.onclick = function () { UI.openCountChooser({ imageKind: 'gallery', galleryIdx: i, title: g.title }); };
+      grid.appendChild(card);
+    });
+  },
+
+  buildThumbs: function () {
+    this.galleryThumbs = window.PDAWG_GALLERY.GALLERY.map(function (g, i) {
+      var cv = window.PDAWG_GALLERY.paint(i, 360, 240, 1234);
+      cv.className = 'thumb-img';
+      return cv;
+    });
+  },
+
+  openCountChooser: function (base) {
+    this._pending = base;
+    var wrap = $('#countBtns');
+    wrap.innerHTML = '';
+    COUNTS.forEach(function (n) {
+      var b = el('button', 'btn count', n + '');
+      b.onclick = function () { UI.startWithCount(n); };
+      wrap.appendChild(b);
+    });
+    $('#rotToggle').checked = false;
+    openModal('#countModal');
+  },
+
+  startWithCount: function (n) {
+    var base = this._pending;
+    closeModal('#countModal');
+    var rot = $('#rotToggle').checked;
+    this.createAndStart({
+      imageKind: base.imageKind, galleryIdx: base.galleryIdx, imageId: base.imageId,
+      title: base.title, count: n, rotationOn: rot, seed: (Math.random() * 1e9) | 0
+    });
+  },
+
+  startDaily: function () {
+    var spec = dailySpec();
+    var self = this;
+    idb.get('puzzles', spec.id).then(function (saved) {
+      if (saved && !saved.won) { self.resumePuzzle(spec.id); return; }
+      self.createAndStart({
+        imageKind: 'daily', galleryIdx: spec.galleryIdx, imageId: null,
+        title: spec.title, count: spec.count, rotationOn: false,
+        seed: hashStr('pdawg-daily-' + dailyStr()), id: spec.id
+      });
+    });
+  },
+
+  createAndStart: function (opts) {
+    var self = this;
+    var aspect, imgW, imgH;
+    function build(imgCanvas) {
+      aspect = imgCanvas.width / imgCanvas.height;
+      imgW = 1200;
+      imgH = Math.round(1200 / aspect);
+      if (imgH > 1000) { imgH = 1000; imgW = Math.round(1000 * aspect); }
+      var grid = gridForCount(opts.count, aspect);
+      var S = newPuzzleState({
+        id: opts.id || uid('p'), title: opts.title,
+        imageKind: opts.imageKind, galleryIdx: opts.galleryIdx, imageId: opts.imageId,
+        imgW: imgW, imgH: imgH, rows: grid.rows, cols: grid.cols,
+        seed: opts.seed, rotationOn: opts.rotationOn,
+        thumb: makeThumb(imgCanvas)
+      });
+      self.showGame();
+      Game.start(S, imgCanvas);
+      Game.saveNow();
+      toast('Puzzle started — progress saves automatically');
+    }
+    if (opts.imageKind === 'custom') {
+      idb.get('images', opts.imageId).then(function (rec) {
+        imageBlobToBitmap(rec.blob).then(function (bmp) {
+          var cv = document.createElement('canvas');
+          cv.width = bmp.width; cv.height = bmp.height;
+          cv.getContext('2d').drawImage(bmp, 0, 0);
+          build(cv);
+        });
+      });
+    } else {
+      build(window.PDAWG_GALLERY.paint(opts.galleryIdx, 1200, Math.round(1200 / 1.5), 1234));
+    }
+  },
+
+  resumePuzzle: function (id) {
+    var self = this;
+    idb.get('puzzles', id).then(function (saved) {
+      if (!saved) { toast('Save not found'); shelf.remove(id); self.renderShelf(); return; }
+      var S = deserializeState(saved);
+      loadImageCanvas(S).then(function (imgCanvas) {
+        self.showGame();
+        Game.start(S, imgCanvas);
+        toast('Welcome back — ' + placedCount(S) + ' of ' + S.pieces.length + ' placed');
+      }).catch(function () { toast('Could not load puzzle image'); });
+    });
+  },
+
+  showWin: function (isBest, prev) {
+    var S = Game.S;
+    if (!S || !S.won) return;
+    $('#winTime').textContent = fmtTime(S.elapsed);
+    $('#winSub').textContent = S.pieces.length + ' pieces · ' + S.title;
+    var badge = $('#winBest');
+    if (isBest) {
+      badge.style.display = '';
+      badge.textContent = prev ? 'New best time!' : 'First completion!';
+    } else badge.style.display = 'none';
+    openModal('#winModal');
+  },
+
+  openPreview: function () {
+    var S = Game.S;
+    var box = $('#previewImg');
+    box.innerHTML = '';
+    var cv = document.createElement('canvas');
+    var w = Math.min(900, S.imgW), h = Math.round(w * S.imgH / S.imgW);
+    cv.width = w; cv.height = h;
+    cv.getContext('2d').drawImage(Game.imgCanvas, 0, 0, w, h);
+    cv.className = 'preview-canvas';
+    box.appendChild(cv);
+    openModal('#previewModal');
+  },
+
+  /* custom photo upload */
+  handleFiles: function (files) {
+    if (!files || !files.length) return;
+    var file = files[0];
+    if (!file.type || file.type.indexOf('image/') !== 0) { toast('That is not an image file'); return; }
+    toast('Preparing your photo…');
+    var self = this;
+    fileToImageRecord(file).then(function (rec) {
+      var imageId = uid('u');
+      idb.put('images', { id: imageId, blob: rec.blob }).then(function () {
+        self.openCountChooser({ imageKind: 'custom', imageId: imageId, title: 'My Photo' });
+      });
+    }).catch(function () { toast('Could not read that image'); });
+  },
+
+  bindGlobal: function () {
+    var self = this;
+    $('#uploadBtn').onclick = function () { $('#fileInput').click(); };
+    $('#fileInput').addEventListener('change', function (e) {
+      self.handleFiles(e.target.files);
+      e.target.value = '';
+    });
+    // drag & drop anywhere on home
+    var home = $('#home');
+    home.addEventListener('dragover', function (e) { e.preventDefault(); home.classList.add('dragging'); });
+    home.addEventListener('dragleave', function () { home.classList.remove('dragging'); });
+    home.addEventListener('drop', function (e) {
+      e.preventDefault(); home.classList.remove('dragging');
+      if (e.dataTransfer && e.dataTransfer.files) self.handleFiles(e.dataTransfer.files);
+    });
+    // paste from clipboard
+    document.addEventListener('paste', function (e) {
+      if ($('#home').style.display === 'none') return;
+      var items = (e.clipboardData && e.clipboardData.files) || [];
+      if (items.length) self.handleFiles(items);
+    });
+    // toolbar
+    $('#backBtn').onclick = function () { Game.stop(); UI.showHome(); };
+    $('#pauseBtn').onclick = function () {
+      Game.paused = true;
+      Game.saveNow();
+      openModal('#pauseModal');
+    };
+    $('#resumeBtn').onclick = function () { closeModal('#pauseModal'); Game.paused = false; Game.markDirty(); };
+    $('#restartBtn').onclick = function () {
+      if (!confirm('Restart this puzzle from scratch?')) return;
+      closeModal('#pauseModal');
+      var S = Game.S;
+      var fresh = newPuzzleState({
+        id: S.id, title: S.title, imageKind: S.imageKind, galleryIdx: S.galleryIdx,
+        imageId: S.imageId, imgW: S.imgW, imgH: S.imgH, rows: S.rows, cols: S.cols,
+        seed: (Math.random() * 1e9) | 0, rotationOn: S.rotationOn, thumb: S.thumb
+      });
+      Game.start(fresh, Game.imgCanvas);
+      Game.saveNow();
+    };
+    $('#exitBtn').onclick = function () { closeModal('#pauseModal'); Game.stop(); UI.showHome(); };
+    $('#ghostRange').addEventListener('input', function (e) {
+      Game.ghost = e.target.value / 100;
+      Game.markDirty();
+    });
+    $('#previewBtn').onclick = function () { UI.openPreview(); };
+    $('#previewClose').onclick = function () { closeModal('#previewModal'); };
+    $('#previewModal').addEventListener('click', function (e) {
+      if (e.target.id === 'previewModal') closeModal('#previewModal');
+    });
+    $('#rotBtn').onclick = function () { Game.rotateSelection(); };
+    $('#edgeBtn').onclick = function () {
+      Game.edgeHi = !Game.edgeHi;
+      $('#edgeBtn').classList.toggle('on', Game.edgeHi);
+      Game.markDirty();
+    };
+    $('#fitBtn').onclick = function () { Game.fitBoard(); };
+    $('#countClose').onclick = function () { closeModal('#countModal'); };
+    // win modal
+    $('#winHome').onclick = function () { closeModal('#winModal'); Game.stop(); UI.showHome(); };
+    $('#winReplay').onclick = function () {
+      closeModal('#winModal');
+      var S = Game.S;
+      var fresh = newPuzzleState({
+        id: uid('p'), title: S.title, imageKind: S.imageKind === 'daily' ? 'gallery' : S.imageKind,
+        galleryIdx: S.galleryIdx, imageId: S.imageId,
+        imgW: S.imgW, imgH: S.imgH, rows: S.rows, cols: S.cols,
+        seed: (Math.random() * 1e9) | 0, rotationOn: S.rotationOn, thumb: S.thumb
+      });
+      if (fresh.imageKind === 'daily') fresh.imageKind = 'gallery';
+      Game.start(fresh, Game.imgCanvas);
+      Game.saveNow();
+    };
+    $('#winNew').onclick = function () { closeModal('#winModal'); Game.stop(); UI.showHome(); };
+  }
+};
+
+/* ---------------- boot ---------------- */
+function boot() {
+  Game.init();
+  UI.buildThumbs();
+  UI.bindGlobal();
+  UI.showHome();
+  idb.open().then(function () {
+    if (idb.mem) toast('Note: private mode - saves may not persist');
+    UI.renderShelf();
+  });
+}
+
+if (typeof document !== 'undefined' && typeof document.querySelector === 'function') {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+}
+
+/* test exports */
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    mulberry32: mulberry32, hashStr: hashStr, clamp: clamp, fmtTime: fmtTime,
+    buildEdges: buildEdges, pieceEdges: pieceEdges, edgeGeom: edgeGeom,
+    strokeGeom: strokeGeom, bezPoint: bezPoint, flattenEdgeOps: flattenEdgeOps,
+    gridForCount: gridForCount, newPuzzleState: newPuzzleState,
+    trueX: trueX, trueY: trueY, snapDist: snapDist, isEdgePiece: isEdgePiece,
+    groupMembers: groupMembers, mergeGroups: mergeGroups, neighborsOf: neighborsOf,
+    snapAfterDrop: snapAfterDrop, rotateGroup: rotateGroup,
+    placedCount: placedCount, isComplete: isComplete,
+    serializeState: serializeState, deserializeState: deserializeState,
+    renderPieceCanvases: renderPieceCanvases,
+    dailySpec: dailySpec, COUNTS: COUNTS
+  };
+}
+})();
