@@ -1119,9 +1119,10 @@ function loadImageCanvas(S) {
     var cx = cv.getContext('2d');
     if (S.imageKind === 'gallery' || S.imageKind === 'daily') {
       var idx = S.galleryIdx;
-      var src = getGallery().paint(idx, Math.round(S.imgW), Math.round(S.imgH), 1234);
-      cx.drawImage(src, 0, 0, cv.width, cv.height);
-      resolve(cv);
+      getGallery().paintAsync(idx, Math.round(S.imgW), Math.round(S.imgH), 1234).then(function (src) {
+        cx.drawImage(src, 0, 0, cv.width, cv.height);
+        resolve(cv);
+      }, reject);
     } else {
       idb.get('images', S.imageId).then(function (rec) {
         if (!rec) { reject(new Error('image missing')); return; }
@@ -1282,6 +1283,7 @@ var UI = {
       var card = el('div', 'gal-card');
       var th = self.galleryThumbs[i];
       if (th) card.appendChild(canvasCopy(th));
+      else if (window.PDAWG_GALLERY.isPhoto(i)) card.appendChild(el('div', 'gal-thumb-loading'));
       card.appendChild(el('div', 'gal-title', g.title));
       card.onclick = function () { UI.openCountChooser({ imageKind: 'gallery', galleryIdx: i, title: g.title }); };
       grid.appendChild(card);
@@ -1289,11 +1291,34 @@ var UI = {
   },
 
   buildThumbs: function () {
-    this.galleryThumbs = window.PDAWG_GALLERY.GALLERY.map(function (g, i) {
-      var cv = window.PDAWG_GALLERY.paint(i, 360, 240, 1234);
-      cv.className = 'thumb-img';
-      return cv;
+    var self = this;
+    var G = window.PDAWG_GALLERY;
+    this.galleryThumbs = G.GALLERY.map(function (g, i) {
+      if (!G.isPhoto(i)) {
+        var cv = G.paint(i, 360, 240, 1234);
+        cv.className = 'thumb-img';
+        return cv;
+      }
+      // Photo item: thumbnail fills in async; the card shows a shimmer until then.
+      G.paintAsync(i, 360, 240, 1234).then(function (pcv) {
+        pcv.className = 'thumb-img';
+        self.galleryThumbs[i] = pcv;
+        self.updateGalleryThumb(i);
+        self.renderDaily();
+      }, function () { /* keep shimmer on load failure */ });
+      return null;
     });
+  },
+
+  updateGalleryThumb: function (i) {
+    var grid = $('#galleryGrid');
+    var card = grid && grid.children[i];
+    var th = this.galleryThumbs[i];
+    if (!card || !th) return;
+    var old = card.querySelector('.gal-thumb-loading, canvas.thumb-img');
+    var im = canvasCopy(th);
+    if (old) card.replaceChild(im, old);
+    else card.insertBefore(im, card.firstChild);
   },
 
   openCountChooser: function (base) {
@@ -1364,7 +1389,12 @@ var UI = {
         });
       });
     } else {
-      build(window.PDAWG_GALLERY.paint(opts.galleryIdx, 1200, Math.round(1200 / 1.5), 1234));
+      // Gallery item: procedural paints are instant; photos load async.
+      var G2 = getGallery();
+      toast('Loading image…');
+      G2.paintAsync(opts.galleryIdx, 1200, Math.round(1200 / 1.5), 1234).then(build, function () {
+        toast('Could not load image');
+      });
     }
   },
 
