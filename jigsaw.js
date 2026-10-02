@@ -16,6 +16,14 @@ function el(tag, cls, html) {
   return d;
 }
 function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+/* canvas.cloneNode() copies dimensions but NOT painted pixels — draw a real copy. */
+function canvasCopy(cv) {
+  var c = document.createElement('canvas');
+  c.width = cv.width; c.height = cv.height;
+  c.className = cv.className;
+  c.getContext('2d').drawImage(cv, 0, 0);
+  return c;
+}
 function fmtTime(ms) {
   var s = Math.floor(ms / 1000);
   var m = Math.floor(s / 60), h = Math.floor(m / 60);
@@ -46,55 +54,76 @@ function uid(prefix) {
  * Sign: +1 = tab points right (v) / down (h). Borders = 0 (flat).
  * Jitter tables vj/hj hold per-boundary random in [-1,1] so neighbors share
  * the exact same curve -> pieces interlock perfectly.
+ * Profile tables vp/hp pick one of NPROF knob shapes per interior boundary,
+ * drawn from the same seeded stream (fixed order) -> reproducible per seed.
  */
+var NPROF = 4;
 function buildEdges(rows, cols, rng) {
-  var v = [], h = [], vj = [], hj = [], r, c;
+  var v = [], h = [], vj = [], hj = [], vp = [], hp = [], r, c;
   for (r = 0; r < rows; r++) {
-    v[r] = []; vj[r] = [];
+    v[r] = []; vj[r] = []; vp[r] = [];
     for (c = 0; c <= cols; c++) {
       var vb = (c === 0 || c === cols);
       v[r][c] = vb ? 0 : (rng() < 0.5 ? -1 : 1);
       vj[r][c] = vb ? 0 : rng() * 2 - 1;
+      vp[r][c] = vb ? 0 : (rng() * NPROF) | 0;
     }
   }
   for (r = 0; r <= rows; r++) {
-    h[r] = []; hj[r] = [];
+    h[r] = []; hj[r] = []; hp[r] = [];
     for (c = 0; c < cols; c++) {
       var hb = (r === 0 || r === rows);
       h[r][c] = hb ? 0 : (rng() < 0.5 ? -1 : 1);
       hj[r][c] = hb ? 0 : rng() * 2 - 1;
+      hp[r][c] = hb ? 0 : (rng() * NPROF) | 0;
     }
   }
-  return { v: v, h: h, vj: vj, hj: hj };
+  return { v: v, h: h, vj: vj, hj: hj, vp: vp, hp: hp };
 }
 
-/* Outward-positive edge signs + jitter for piece (r,c). */
+/* Outward-positive edge signs + jitter + knob profile for piece (r,c).
+ * Profile fields default to 0 when the table predates them (old saves). */
 function pieceEdges(E, r, c) {
   return {
     top: -E.h[r][c], right: E.v[r][c + 1], bottom: E.h[r + 1][c], left: -E.v[r][c],
-    tj: E.hj[r][c], rj: E.vj[r][c + 1], bj: E.hj[r + 1][c], lj: E.vj[r][c]
+    tj: E.hj[r][c], rj: E.vj[r][c + 1], bj: E.hj[r + 1][c], lj: E.vj[r][c],
+    tp: E.hp ? E.hp[r][c] : 0, rp: E.vp ? E.vp[r][c + 1] : 0,
+    bp: E.hp ? E.hp[r + 1][c] : 0, lp: E.vp ? E.vp[r][c] : 0
   };
 }
 
-/* Knob-curve ops for one edge from (x1,y1) to (x2,y2).
- * Positive tab bulges toward the LEFT of the travel direction.
- * The curve is mirror-symmetric about its midpoint, so tracing the same
+/* Knob profiles as [fraction-along-edge, offset] point lists.
+ * Every profile is mirror-symmetric about f=0.5, so tracing the same
  * boundary in reverse with the opposite tab sign yields the identical
- * geometric curve -> neighbor pieces interlock exactly. */
-function edgeGeom(x1, y1, x2, y2, tab, jit) {
+ * geometric curve -> neighbor pieces interlock exactly.
+ * First point gets a lineTo, then each 3 points form a bezier. */
+var PROFILES = [
+  /* 0: classic round knob */
+  [[0.32, 0], [0.40, 0.02], [0.36, 0.10], [0.42, 0.14], [0.46, 0.22], [0.54, 0.22], [0.58, 0.14], [0.64, 0.10], [0.60, 0.02], [0.68, 0]],
+  /* 1: pointed knob */
+  [[0.30, 0], [0.40, 0.02], [0.36, 0.10], [0.44, 0.14], [0.46, 0.26], [0.54, 0.26], [0.56, 0.14], [0.64, 0.10], [0.60, 0.02], [0.70, 0]],
+  /* 2: wide shallow knob */
+  [[0.24, 0], [0.30, 0.02], [0.28, 0.06], [0.36, 0.08], [0.44, 0.12], [0.56, 0.12], [0.64, 0.08], [0.72, 0.06], [0.70, 0.02], [0.76, 0]],
+  /* 3: narrow deep knob */
+  [[0.38, 0], [0.42, 0.03], [0.40, 0.12], [0.44, 0.18], [0.47, 0.30], [0.53, 0.30], [0.56, 0.18], [0.60, 0.12], [0.58, 0.03], [0.62, 0]]
+];
+
+/* Knob-curve ops for one edge from (x1,y1) to (x2,y2).
+ * Positive tab bulges toward the LEFT of the travel direction. */
+function edgeGeom(x1, y1, x2, y2, tab, jit, prof) {
   if (tab === 0) return [{ t: 'l', p: [x2, y2] }];
   var dx = x2 - x1, dy = y2 - y1;
   var len = Math.hypot(dx, dy) || 1;
   var nx = -dy / len, ny = dx / len;
   var off = tab * (0.20 + 0.05 * jit);
+  var pts = PROFILES[(prof >= 0 && prof < PROFILES.length) ? prof : 0];
   function P(f, o) { return [x1 + dx * f + nx * len * o * off, y1 + dy * f + ny * len * o * off]; }
-  return [
-    { t: 'l', p: P(0.32, 0) },
-    { t: 'c', p: [P(0.40, 0.02), P(0.36, 0.10), P(0.42, 0.14)] },
-    { t: 'c', p: [P(0.46, 0.22), P(0.54, 0.22), P(0.58, 0.14)] },
-    { t: 'c', p: [P(0.64, 0.10), P(0.60, 0.02), P(0.68, 0)] },
-    { t: 'l', p: [x2, y2] }
-  ];
+  var ops = [{ t: 'l', p: P(pts[0][0], pts[0][1]) }];
+  for (var i = 1; i + 2 < pts.length; i += 3) {
+    ops.push({ t: 'c', p: [P(pts[i][0], pts[i][1]), P(pts[i + 1][0], pts[i + 1][1]), P(pts[i + 2][0], pts[i + 2][1])] });
+  }
+  ops.push({ t: 'l', p: [x2, y2] });
+  return ops;
 }
 
 function strokeGeom(ctx, ops) {
@@ -109,10 +138,10 @@ function strokeGeom(ctx, ops) {
 function tracePiecePath(ctx, ox, oy, w, h, e) {
   ctx.beginPath();
   ctx.moveTo(ox, oy);
-  strokeGeom(ctx, edgeGeom(ox, oy, ox + w, oy, -e.top, e.tj));
-  strokeGeom(ctx, edgeGeom(ox + w, oy, ox + w, oy + h, -e.right, e.rj));
-  strokeGeom(ctx, edgeGeom(ox + w, oy + h, ox, oy + h, -e.bottom, e.bj));
-  strokeGeom(ctx, edgeGeom(ox, oy + h, ox, oy, -e.left, e.lj));
+  strokeGeom(ctx, edgeGeom(ox, oy, ox + w, oy, -e.top, e.tj, e.tp));
+  strokeGeom(ctx, edgeGeom(ox + w, oy, ox + w, oy + h, -e.right, e.rj, e.rp));
+  strokeGeom(ctx, edgeGeom(ox + w, oy + h, ox, oy + h, -e.bottom, e.bj, e.bp));
+  strokeGeom(ctx, edgeGeom(ox, oy + h, ox, oy, -e.left, e.lj, e.lp));
   ctx.closePath();
 }
 
@@ -217,6 +246,17 @@ var bests = {
 
 /* ---------------- puzzle setup ---------------- */
 var COUNTS = [24, 54, 108, 216, 432];
+var LEVELS = [
+  { name: 'Cozy', count: 24 },
+  { name: 'Classic', count: 54 },
+  { name: 'Tricky', count: 108 },
+  { name: 'Tough', count: 216 },
+  { name: 'Master', count: 432 }
+];
+function levelForCount(n) {
+  for (var i = 0; i < LEVELS.length; i++) if (LEVELS[i].count === n) return LEVELS[i];
+  return { name: n + ' pieces', count: n };
+}
 
 function gridForCount(n, aspect) {
   var cols = Math.max(2, Math.round(Math.sqrt(n * aspect)));
@@ -499,7 +539,15 @@ var Game = {
   resize: function () {
     var wrap = $('#game');
     this.dpr = Math.min(2.5, window.devicePixelRatio || 1);
-    this.cw = wrap.clientWidth; this.ch = wrap.clientHeight;
+    // Size the canvas to its flex-allocated box: container minus the
+    // topbar and toolbar. (Measuring #game alone and forcing the canvas
+    // to that height overflows the flex column and pushes the toolbar
+    // below the fold on desktop.)
+    var topbar = wrap.querySelector('.topbar');
+    var toolbar = wrap.querySelector('.toolbar');
+    var chromeH = (topbar ? topbar.offsetHeight : 0) + (toolbar ? toolbar.offsetHeight : 0);
+    this.cw = wrap.clientWidth;
+    this.ch = Math.max(50, wrap.clientHeight - chromeH);
     this.canvas.width = Math.round(this.cw * this.dpr);
     this.canvas.height = Math.round(this.ch * this.dpr);
     this.canvas.style.width = this.cw + 'px';
@@ -1122,9 +1170,9 @@ var UI = {
     wrap.innerHTML = '';
     var tag = el('div', 'card-tag', 'DAILY PUZZLE');
     var title = el('div', 'card-title', window.PDAWG_GALLERY.GALLERY[spec.galleryIdx].title);
-    var sub = el('div', 'card-sub', spec.count + ' pieces' + (done ? ' &nbsp;·&nbsp; done in ' + fmtTime(done.ms) : ''));
+    var sub = el('div', 'card-sub', levelForCount(spec.count).name + ' · ' + spec.count + ' pieces' + (done ? ' &nbsp;·&nbsp; done in ' + fmtTime(done.ms) : ''));
     var btn = el('button', 'btn primary', done ? 'Play again' : 'Play today');
-    if (thumb) { var im = el('div', 'card-thumb'); im.appendChild(thumb.cloneNode()); wrap.appendChild(im); }
+    if (thumb) { var im = el('div', 'card-thumb'); im.appendChild(canvasCopy(thumb)); wrap.appendChild(im); }
     var tx = el('div', 'card-text');
     tx.appendChild(tag); tx.appendChild(title); tx.appendChild(sub);
     wrap.appendChild(tx); wrap.appendChild(btn);
@@ -1166,7 +1214,7 @@ var UI = {
     window.PDAWG_GALLERY.GALLERY.forEach(function (g, i) {
       var card = el('div', 'gal-card');
       var th = self.galleryThumbs[i];
-      if (th) card.appendChild(th.cloneNode());
+      if (th) card.appendChild(canvasCopy(th));
       card.appendChild(el('div', 'gal-title', g.title));
       card.onclick = function () { UI.openCountChooser({ imageKind: 'gallery', galleryIdx: i, title: g.title }); };
       grid.appendChild(card);
@@ -1185,9 +1233,10 @@ var UI = {
     this._pending = base;
     var wrap = $('#countBtns');
     wrap.innerHTML = '';
-    COUNTS.forEach(function (n) {
-      var b = el('button', 'btn count', n + '');
-      b.onclick = function () { UI.startWithCount(n); };
+    LEVELS.forEach(function (L) {
+      var b = el('button', 'btn count');
+      b.innerHTML = '<div class="lvl-name">' + L.name + '</div><div class="lvl-count">' + L.count + ' pieces</div>';
+      b.onclick = function () { UI.startWithCount(L.count); };
       wrap.appendChild(b);
     });
     $('#rotToggle').checked = false;
@@ -1405,6 +1454,8 @@ if (typeof document !== 'undefined' && typeof document.querySelector === 'functi
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     mulberry32: mulberry32, hashStr: hashStr, clamp: clamp, fmtTime: fmtTime,
+    canvasCopy: canvasCopy,
+    NPROF: NPROF, PROFILES: PROFILES,
     buildEdges: buildEdges, pieceEdges: pieceEdges, edgeGeom: edgeGeom,
     strokeGeom: strokeGeom, bezPoint: bezPoint, flattenEdgeOps: flattenEdgeOps,
     gridForCount: gridForCount, newPuzzleState: newPuzzleState,
@@ -1414,7 +1465,7 @@ if (typeof module !== 'undefined' && module.exports) {
     placedCount: placedCount, isComplete: isComplete,
     serializeState: serializeState, deserializeState: deserializeState,
     renderPieceCanvases: renderPieceCanvases,
-    dailySpec: dailySpec, COUNTS: COUNTS
+    dailySpec: dailySpec, COUNTS: COUNTS, LEVELS: LEVELS, levelForCount: levelForCount
   };
 }
 })();
