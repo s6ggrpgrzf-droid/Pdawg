@@ -508,7 +508,19 @@ var GALLERY = [
   { id: 'g6', title: 'City at Dusk', make: cityDusk },
   { id: 'g7', title: 'Desert Sun', make: desertSun },
   { id: 'g8', title: 'Forest Falls', make: forestFalls },
-  { id: 'g9', title: 'Nebula', make: nebula }
+  { id: 'g9', title: 'Nebula', make: nebula },
+  // National-parks photo series (bundled JPEGs in parks/). Appended after the
+  // procedural scenes so existing galleryIdx values (0-9) keep working in saves.
+  { id: 'p0', title: 'Yosemite', photo: 'parks/park-01.jpg' },
+  { id: 'p1', title: 'Yellowstone', photo: 'parks/park-02.jpg' },
+  { id: 'p2', title: 'Grand Canyon', photo: 'parks/park-03.jpg' },
+  { id: 'p3', title: 'Zion', photo: 'parks/park-04.jpg' },
+  { id: 'p4', title: 'Arches', photo: 'parks/park-05.jpg' },
+  { id: 'p5', title: 'Glacier', photo: 'parks/park-06.jpg' },
+  { id: 'p6', title: 'Grand Teton', photo: 'parks/park-07.jpg' },
+  { id: 'p7', title: 'Acadia', photo: 'parks/park-08.jpg' },
+  { id: 'p8', title: 'Bryce Canyon', photo: 'parks/park-09.jpg' },
+  { id: 'p9', title: 'Olympic', photo: 'parks/park-10.jpg' }
 ];
 
 function paintGalleryImage(idx, W, H, seed) {
@@ -519,9 +531,46 @@ function paintGalleryImage(idx, W, H, seed) {
   return cv;
 }
 
+/* ---------------- photo items (async) ---------------- */
+
+var _photoCache = {}; // idx -> { img } once loaded
+
+function loadPhoto(idx) {
+  // Returns Promise<HTMLImageElement>; cached after first load.
+  if (_photoCache[idx]) return Promise.resolve(_photoCache[idx]);
+  return new Promise(function (resolve, reject) {
+    var img = new Image();
+    img.onload = function () { _photoCache[idx] = img; resolve(img); };
+    img.onerror = function () { reject(new Error('photo load failed: ' + GALLERY[idx].photo)); };
+    img.src = GALLERY[idx].photo;
+  });
+}
+
+function paintPhoto(idx, W, H) {
+  // Cover-fit the photo into a W x H canvas. Returns Promise<canvas>.
+  return loadPhoto(idx).then(function (img) {
+    var cv = document.createElement('canvas');
+    cv.width = W; cv.height = H;
+    var ctx = cv.getContext('2d');
+    var s = Math.max(W / img.naturalWidth, H / img.naturalHeight);
+    var dw = img.naturalWidth * s, dh = img.naturalHeight * s;
+    ctx.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
+    return cv;
+  });
+}
+
+function isPhoto(idx) { return !!GALLERY[idx].photo; }
+
+function paintAsync(idx, W, H, seed) {
+  // Promise<canvas> for any gallery item: procedural paints resolve
+  // immediately, photos resolve once the JPEG loads.
+  if (isPhoto(idx)) return paintPhoto(idx, W, H);
+  return Promise.resolve(paintGalleryImage(idx, W, H, seed));
+}
+
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { GALLERY: GALLERY, mulberry32: mulberry32, paintGalleryImage: paintGalleryImage, paint: paintGalleryImage };
+  module.exports = { GALLERY: GALLERY, mulberry32: mulberry32, paintGalleryImage: paintGalleryImage, paint: paintGalleryImage, paintAsync: paintAsync, isPhoto: isPhoto };
 } else {
-  window.PDAWG_GALLERY = { GALLERY: GALLERY, mulberry32: mulberry32, paint: paintGalleryImage };
+  window.PDAWG_GALLERY = { GALLERY: GALLERY, mulberry32: mulberry32, paint: paintGalleryImage, paintAsync: paintAsync, isPhoto: isPhoto };
 }
 })();
