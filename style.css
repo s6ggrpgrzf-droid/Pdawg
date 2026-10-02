@@ -47,6 +47,12 @@ h2 { font-size: 19px; margin: 26px 0 12px; }
   overflow: hidden; cursor: pointer;
 }
 .gal-card .thumb-img { width: 100%; height: auto; aspect-ratio: 3/2; }
+.gal-thumb-loading {
+  width: 100%; aspect-ratio: 3/2; display: block;
+  background: linear-gradient(100deg, #232838 40%, #303a58 50%, #232838 60%);
+  background-size: 200% 100%; animation: gal-shimmer 1.4s linear infinite;
+}
+@keyframes gal-shimmer { to { background-position: -200% 0; } }
 .gal-card:active { transform: scale(0.97); }
 .gal-title { padding: 8px 10px 10px; font-size: 14px; font-weight: 600; }
 
