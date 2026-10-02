@@ -56,6 +56,10 @@ function uid(prefix) {
  * the exact same curve -> pieces interlock perfectly.
  * Profile tables vp/hp pick one of NPROF knob shapes per interior boundary,
  * drawn from the same seeded stream (fixed order) -> reproducible per seed.
+ * Non-uniform knobs (like real die-cut puzzles): vo/ho = knob center offset
+ * along the edge (0.32..0.68, 0.5 = centered), vs/hs = knob size multiplier
+ * (0.75..1.3), vw/hw = wobble seed for the straight runs. These are drawn
+ * AFTER the legacy stream so old saves rebuild identical base tables.
  */
 var NPROF = 4;
 function buildEdges(rows, cols, rng) {
@@ -78,17 +82,48 @@ function buildEdges(rows, cols, rng) {
       hp[r][c] = hb ? 0 : (rng() * NPROF) | 0;
     }
   }
-  return { v: v, h: h, vj: vj, hj: hj, vp: vp, hp: hp };
+  // Per-boundary knob offset / scale / wobble. Separate pass keeps the
+  // legacy rng stream untouched, so pre-existing saves rebuild the same
+  // signs, jitters and profiles they were created with.
+  var vo = [], ho = [], vs = [], hs = [], vw = [], hw = [];
+  for (r = 0; r < rows; r++) {
+    vo[r] = []; vs[r] = []; vw[r] = [];
+    for (c = 0; c <= cols; c++) {
+      var vb2 = (c === 0 || c === cols);
+      vo[r][c] = vb2 ? 0.5 : 0.32 + rng() * 0.36;
+      vs[r][c] = vb2 ? 1 : 0.75 + rng() * 0.55;
+      vw[r][c] = vb2 ? 0 : rng();
+    }
+  }
+  for (r = 0; r <= rows; r++) {
+    ho[r] = []; hs[r] = []; hw[r] = [];
+    for (c = 0; c < cols; c++) {
+      var hb2 = (r === 0 || r === rows);
+      ho[r][c] = hb2 ? 0.5 : 0.32 + rng() * 0.36;
+      hs[r][c] = hb2 ? 1 : 0.75 + rng() * 0.55;
+      hw[r][c] = hb2 ? 0 : rng();
+    }
+  }
+  return { v: v, h: h, vj: vj, hj: hj, vp: vp, hp: hp, vo: vo, ho: ho, vs: vs, hs: hs, vw: vw, hw: hw };
 }
 
 /* Outward-positive edge signs + jitter + knob profile for piece (r,c).
- * Profile fields default to 0 when the table predates them (old saves). */
+ * Profile fields default to 0 when the table predates them (old saves).
+ * Knob offset is mirrored for reverse-traced edges (bottom/left) so the
+ * knob lands on the same geometric spot for both neighbors; wobble needs
+ * no mirroring because its sine is antisymmetric about the edge midpoint. */
 function pieceEdges(E, r, c) {
   return {
     top: -E.h[r][c], right: E.v[r][c + 1], bottom: E.h[r + 1][c], left: -E.v[r][c],
     tj: E.hj[r][c], rj: E.vj[r][c + 1], bj: E.hj[r + 1][c], lj: E.vj[r][c],
     tp: E.hp ? E.hp[r][c] : 0, rp: E.vp ? E.vp[r][c + 1] : 0,
-    bp: E.hp ? E.hp[r + 1][c] : 0, lp: E.vp ? E.vp[r][c] : 0
+    bp: E.hp ? E.hp[r + 1][c] : 0, lp: E.vp ? E.vp[r][c] : 0,
+    to: E.ho ? E.ho[r][c] : 0.5, ro: E.vo ? E.vo[r][c + 1] : 0.5,
+    bo: E.ho ? 1 - E.ho[r + 1][c] : 0.5, lo: E.vo ? 1 - E.vo[r][c] : 0.5,
+    ts: E.hs ? E.hs[r][c] : 1, rs: E.vs ? E.vs[r][c + 1] : 1,
+    bs: E.hs ? E.hs[r + 1][c] : 1, ls: E.vs ? E.vs[r][c] : 1,
+    tw: E.hw ? E.hw[r][c] : 0, rw: E.vw ? E.vw[r][c + 1] : 0,
+    bw: E.hw ? E.hw[r + 1][c] : 0, lw: E.vw ? E.vw[r][c] : 0
   };
 }
 
@@ -109,20 +144,60 @@ var PROFILES = [
 ];
 
 /* Knob-curve ops for one edge from (x1,y1) to (x2,y2).
- * Positive tab bulges toward the LEFT of the travel direction. */
-function edgeGeom(x1, y1, x2, y2, tab, jit, prof) {
+ * Positive tab bulges toward the LEFT of the travel direction.
+ * off: knob center as a fraction along the edge (0.32..0.68).
+ * scl: knob size multiplier (0.75..1.3) — scales protrusion fully and
+ *      knob width mildly so the knob never reaches the corners.
+ * wob: wobble seed in [0,1) for the straight runs. The wobble is an
+ *      antisymmetric sine (zero at both corners), so tracing the same
+ *      boundary in reverse with the opposite tab yields the identical
+ *      geometric curve -> neighbor pieces interlock exactly. */
+function edgeGeom(x1, y1, x2, y2, tab, jit, prof, off, scl, wob) {
   if (tab === 0) return [{ t: 'l', p: [x2, y2] }];
+  off = (off === undefined) ? 0.5 : off;
+  scl = (scl === undefined) ? 1 : scl;
+  wob = (wob === undefined) ? 0 : wob;
   var dx = x2 - x1, dy = y2 - y1;
   var len = Math.hypot(dx, dy) || 1;
   var nx = -dy / len, ny = dx / len;
-  var off = tab * (0.20 + 0.05 * jit);
-  var pts = PROFILES[(prof >= 0 && prof < PROFILES.length) ? prof : 0];
-  function P(f, o) { return [x1 + dx * f + nx * len * o * off, y1 + dy * f + ny * len * o * off]; }
-  var ops = [{ t: 'l', p: P(pts[0][0], pts[0][1]) }];
-  for (var i = 1; i + 2 < pts.length; i += 3) {
-    ops.push({ t: 'c', p: [P(pts[i][0], pts[i][1]), P(pts[i + 1][0], pts[i + 1][1]), P(pts[i + 2][0], pts[i + 2][1])] });
+  var depth = tab * (0.20 + 0.05 * jit);
+  var wscl = 0.8 + 0.2 * scl;
+  var wk = 1 + ((wob * 2) | 0);                    /* 1 or 2 waves */
+  var ws = (((wob * 4) | 0) % 2 === 0) ? 1 : -1;   /* wobble sign */
+  var wamp = 0.015;
+  function W(f) { return wamp * ws * Math.sin(2 * Math.PI * wk * (f - 0.5)); }
+  /* P takes the GEOMETRIC fraction along the edge; wobble is evaluated
+   * there so both neighbors displace the same physical point equally. */
+  function P(fg, o) {
+    var w = W(fg);
+    return [
+      x1 + dx * fg + nx * len * (o * depth + w),
+      y1 + dy * fg + ny * len * (o * depth + w)
+    ];
   }
-  ops.push({ t: 'l', p: [x2, y2] });
+  var pts = PROFILES[(prof >= 0 && prof < PROFILES.length) ? prof : 0];
+  function F(fp) { return off + (fp - 0.5) * wscl; }
+  var ks = F(pts[0][0]), ke = F(pts[pts.length - 1][0]);
+  var ops = [], i, j, k, f;
+  /* lead-in: subdivided so the wobble renders (corners stay exact: W(0)=0) */
+  var NSEG = 5;
+  for (i = 1; i <= NSEG; i++) {
+    f = ks * i / NSEG;
+    ops.push({ t: 'l', p: P(f, 0) });
+  }
+  for (j = 1; j + 2 < pts.length; j += 3) {
+    ops.push({
+      t: 'c', p: [
+        P(F(pts[j][0]), pts[j][1] * scl),
+        P(F(pts[j + 1][0]), pts[j + 1][1] * scl),
+        P(F(pts[j + 2][0]), pts[j + 2][1] * scl)
+      ]
+    });
+  }
+  for (k = 1; k <= NSEG; k++) {
+    f = ke + (1 - ke) * k / NSEG;
+    ops.push({ t: 'l', p: P(f, 0) });
+  }
   return ops;
 }
 
@@ -138,10 +213,10 @@ function strokeGeom(ctx, ops) {
 function tracePiecePath(ctx, ox, oy, w, h, e) {
   ctx.beginPath();
   ctx.moveTo(ox, oy);
-  strokeGeom(ctx, edgeGeom(ox, oy, ox + w, oy, -e.top, e.tj, e.tp));
-  strokeGeom(ctx, edgeGeom(ox + w, oy, ox + w, oy + h, -e.right, e.rj, e.rp));
-  strokeGeom(ctx, edgeGeom(ox + w, oy + h, ox, oy + h, -e.bottom, e.bj, e.bp));
-  strokeGeom(ctx, edgeGeom(ox, oy + h, ox, oy, -e.left, e.lj, e.lp));
+  strokeGeom(ctx, edgeGeom(ox, oy, ox + w, oy, -e.top, e.tj, e.tp, e.to, e.ts, e.tw));
+  strokeGeom(ctx, edgeGeom(ox + w, oy, ox + w, oy + h, -e.right, e.rj, e.rp, e.ro, e.rs, e.rw));
+  strokeGeom(ctx, edgeGeom(ox + w, oy + h, ox, oy + h, -e.bottom, e.bj, e.bp, e.bo, e.bs, e.bw));
+  strokeGeom(ctx, edgeGeom(ox, oy + h, ox, oy, -e.left, e.lj, e.lp, e.lo, e.ls, e.lw));
   ctx.closePath();
 }
 
