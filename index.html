@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#14161f">
+<title>Pdawg Puzzles</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ============ HOME ============ -->
+<div id="home">
+  <header class="home-head">
+    <h1>&#129521; Pdawg Puzzles</h1>
+    <p class="tagline">Calm jigsaw puzzles. No ads, no accounts &mdash; your progress saves itself.</p>
+  </header>
+
+  <section id="dailyCard" class="card daily" aria-label="Daily puzzle"></section>
+
+  <section id="shelfSection" class="shelf-sec" style="display:none">
+    <h2>My Puzzles</h2>
+    <div id="shelfRow" class="shelf-row"></div>
+  </section>
+
+  <section class="upload-sec">
+    <button id="uploadBtn" class="btn primary big">&#128247; Make a puzzle from your photo</button>
+    <p class="hint">…or drag &amp; drop an image here, or paste one from your clipboard</p>
+    <input type="file" id="fileInput" accept="image/*" hidden>
+  </section>
+
+  <section class="gal-sec">
+    <h2>Gallery</h2>
+    <div id="galleryGrid" class="gal-grid"></div>
+  </section>
+
+  <footer class="home-foot">Made with &#10084;&#65039; by Jimmy &amp; Pip</footer>
+</div>
+
+<!-- ============ GAME ============ -->
+<div id="game" style="display:none">
+  <div class="topbar">
+    <button id="backBtn" class="tbtn" title="Save &amp; exit">&#8592;</button>
+    <div class="top-mid">
+      <div id="puzzleTitle" class="ptitle">Puzzle</div>
+      <div class="prow"><span id="timer" class="timer">0:00</span><span id="prog" class="prog"></span></div>
+    </div>
+    <button id="pauseBtn" class="tbtn" title="Pause">&#10074;&#10074;</button>
+  </div>
+  <canvas id="board"></canvas>
+  <div class="toolbar">
+    <label class="ghost-wrap" title="Ghost image opacity">
+      <span>&#128065;</span>
+      <input type="range" id="ghostRange" min="0" max="55" value="15">
+    </label>
+    <button id="previewBtn" class="tbtn" title="Preview picture">&#128444;&#65039;</button>
+    <button id="rotBtn" class="tbtn" title="Rotate selected 90&deg;" style="display:none">&#8635;</button>
+    <button id="edgeBtn" class="tbtn" title="Highlight edge pieces">&#129521;</button>
+    <button id="fitBtn" class="tbtn" title="Fit board to screen">&#10530;</button>
+  </div>
+</div>
+
+<!-- ============ MODALS ============ -->
+<div id="countModal" class="modal">
+  <div class="sheet">
+    <h3>How many pieces?</h3>
+    <div id="countBtns" class="count-btns"></div>
+    <label class="rot-row"><input type="checkbox" id="rotToggle"> &#8635; Rotation mode <small>(pieces can turn &mdash; harder!)</small></label>
+    <button id="countClose" class="btn">Cancel</button>
+  </div>
+</div>
+
+<div id="previewModal" class="modal">
+  <div class="sheet wide">
+    <div id="previewImg"></div>
+    <button id="previewClose" class="btn">Close</button>
+  </div>
+</div>
+
+<div id="pauseModal" class="modal">
+  <div class="sheet">
+    <h3>Paused</h3>
+    <p class="hint">Your progress is saved automatically.</p>
+    <div class="btn-col">
+      <button id="resumeBtn" class="btn primary">Resume</button>
+      <button id="restartBtn" class="btn">Restart puzzle</button>
+      <button id="exitBtn" class="btn">Save &amp; exit</button>
+    </div>
+  </div>
+</div>
+
+<div id="winModal" class="modal">
+  <div class="sheet win">
+    <div class="win-emoji">&#127881;</div>
+    <h3>Puzzle complete!</h3>
+    <div id="winBest" class="best-badge" style="display:none"></div>
+    <div id="winTime" class="win-time">0:00</div>
+    <div id="winSub" class="hint"></div>
+    <div class="btn-col">
+      <button id="winReplay" class="btn primary">Play again</button>
+      <button id="winNew" class="btn">Choose another</button>
+      <button id="winHome" class="btn">My puzzles</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script src="gallery.js"></script>
+<script src="jigsaw.js"></script>
+</body>
+</html>
