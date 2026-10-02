@@ -592,7 +592,7 @@ var Game = {
   cam: { x: 0, y: 0, s: 1 },
   dpr: 1, cw: 0, ch: 0,
   dirty: true, raf: 0, lastT: 0,
-  selection: null, ghost: 0.15, edgeHi: false,
+  selection: null, edgeHi: false,
   paused: false, confetti: null,
   pointers: new Map(), gesture: null, downInfo: null,
   saveTimer: 0,
@@ -656,8 +656,7 @@ var Game = {
     this.selection = null;
     this.paused = false;
     this.confetti = null;
-    this.ghost = 0.15; this.edgeHi = false;
-    $('#ghostRange').value = 15;
+    this.edgeHi = false;
     $('#edgeBtn').classList.remove('on');
     this.resize();
     this.fitBoard();
@@ -715,13 +714,6 @@ var Game = {
     // board backdrop
     ctx.fillStyle = '#1c1f2b';
     ctx.fillRect(0, 0, S.boardW, S.boardH);
-    // ghost image
-    if (this.ghost > 0.005) {
-      ctx.save();
-      ctx.globalAlpha = this.ghost;
-      ctx.drawImage(this.imgCanvas, S.imgOX, S.imgOY, S.imgW, S.imgH);
-      ctx.restore();
-    }
     // image frame outline
     ctx.strokeStyle = 'rgba(255,255,255,0.14)';
     ctx.lineWidth = 2 / s;
@@ -1472,10 +1464,6 @@ var UI = {
       Game.saveNow();
     };
     $('#exitBtn').onclick = function () { closeModal('#pauseModal'); Game.stop(); UI.showHome(); };
-    $('#ghostRange').addEventListener('input', function (e) {
-      Game.ghost = e.target.value / 100;
-      Game.markDirty();
-    });
     $('#previewBtn').onclick = function () { UI.openPreview(); };
     $('#previewClose').onclick = function () { closeModal('#previewModal'); };
     $('#previewModal').addEventListener('click', function (e) {
