@@ -79,7 +79,7 @@ h2 { font-size: 19px; margin: 26px 0 12px; }
 .topbar {
   display: flex; align-items: center; gap: 10px;
   padding: 8px 12px; background: #1a1d29; border-bottom: 1px solid #2c3145;
-  z-index: 5;
+  z-index: 5; flex: 0 0 auto;
 }
 .top-mid { flex: 1; min-width: 0; text-align: center; }
 .ptitle { font-weight: 700; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -89,16 +89,22 @@ h2 { font-size: 19px; margin: 26px 0 12px; }
 #board { flex: 1; display: block; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
 .toolbar {
   display: flex; align-items: center; justify-content: space-around; gap: 6px;
-  padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+  padding: 10px 12px;
   background: #1a1d29; border-top: 1px solid #2c3145; z-index: 5;
+  flex: 0 0 auto;
 }
 .tbtn {
-  width: 52px; height: 52px; border-radius: 14px; font-size: 24px;
+  min-width: 60px; height: 60px; border-radius: 14px; font-size: 24px;
   background: #2a3044; color: #f2f3f7; border: 1px solid #3a4158; cursor: pointer;
-  display: flex; align-items: center; justify-content: center;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+  padding: 6px 10px;
 }
 .tbtn:active { transform: scale(0.93); }
 .tbtn.on { background: #6c5ce7; border-color: #6c5ce7; }
+.tbtn small { font-size: 10px; font-weight: 700; color: #9aa0b5; letter-spacing: 0.4px; text-transform: uppercase; }
+.tbtn.on small { color: #fff; }
+.tbtn.accent { border-color: #6c5ce7; box-shadow: 0 0 0 1px #6c5ce7, 0 0 14px rgba(108,92,231,0.35); }
+.tbtn.accent small { color: #a79bff; }
 .ghost-wrap { display: flex; align-items: center; gap: 8px; font-size: 22px; }
 .ghost-wrap input { width: 110px; accent-color: #6c5ce7; height: 44px; }
 
@@ -117,7 +123,9 @@ h2 { font-size: 19px; margin: 26px 0 12px; }
 .sheet.wide { max-width: 640px; }
 .sheet h3 { margin: 0 0 14px; font-size: 20px; }
 .count-btns { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-bottom: 16px; }
-.btn.count { min-width: 64px; }
+.btn.count { min-width: 96px; padding: 10px 14px; }
+.lvl-name { font-size: 17px; font-weight: 800; }
+.lvl-count { font-size: 12px; color: #9aa0b5; margin-top: 3px; }
 .rot-row { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 4px 0 16px; font-size: 15px; }
 .rot-row input { width: 22px; height: 22px; accent-color: #6c5ce7; }
 .rot-row small { color: #9aa0b5; }
