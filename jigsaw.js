@@ -91,7 +91,7 @@ function buildEdges(rows, cols, rng) {
     for (c = 0; c <= cols; c++) {
       var vb2 = (c === 0 || c === cols);
       vo[r][c] = vb2 ? 0.5 : 0.32 + rng() * 0.36;
-      vs[r][c] = vb2 ? 1 : 0.75 + rng() * 0.55;
+      vs[r][c] = vb2 ? 1 : 0.85 + rng() * 0.30;
       vw[r][c] = vb2 ? 0 : rng();
     }
   }
@@ -100,7 +100,7 @@ function buildEdges(rows, cols, rng) {
     for (c = 0; c < cols; c++) {
       var hb2 = (r === 0 || r === rows);
       ho[r][c] = hb2 ? 0.5 : 0.32 + rng() * 0.36;
-      hs[r][c] = hb2 ? 1 : 0.75 + rng() * 0.55;
+      hs[r][c] = hb2 ? 1 : 0.85 + rng() * 0.30;
       hw[r][c] = hb2 ? 0 : rng();
     }
   }
@@ -160,8 +160,8 @@ function edgeGeom(x1, y1, x2, y2, tab, jit, prof, off, scl, wob) {
   var dx = x2 - x1, dy = y2 - y1;
   var len = Math.hypot(dx, dy) || 1;
   var nx = -dy / len, ny = dx / len;
-  var depth = tab * (0.20 + 0.05 * jit);
-  var wscl = 0.8 + 0.2 * scl;
+  var depth = tab * (0.13 + 0.03 * jit);
+  var wscl = 0.62 + 0.18 * scl;
   var wk = 1 + ((wob * 2) | 0);                    /* 1 or 2 waves */
   var ws = (((wob * 4) | 0) % 2 === 0) ? 1 : -1;   /* wobble sign */
   var wamp = 0.015;
