@@ -105,8 +105,6 @@ h2 { font-size: 19px; margin: 26px 0 12px; }
 .tbtn.on small { color: #fff; }
 .tbtn.accent { border-color: #6c5ce7; box-shadow: 0 0 0 1px #6c5ce7, 0 0 14px rgba(108,92,231,0.35); }
 .tbtn.accent small { color: #a79bff; }
-.ghost-wrap { display: flex; align-items: center; gap: 8px; font-size: 22px; }
-.ghost-wrap input { width: 110px; accent-color: #6c5ce7; height: 44px; }
 
 /* ---------- modals ---------- */
 .modal {
